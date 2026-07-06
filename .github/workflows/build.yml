@@ -1,18 +1,32 @@
-name: Rust
+name: Build
 
 on:
+  workflow_dispatch:
   push:
     branches:
-     - main
+      - mewlua/main
     tags:
-     - "*"
+      - "mewlua-v*"
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
-     - main
+      - mewlua/main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_ARGS: -p emmylua_ls -p emmylua_check -p emmylua_doc_cli -p emmylua_formatter
+  BINARY_NAMES: emmylua_ls emmylua_check emmylua_doc_cli luafmt
 
 jobs:
   build:
+    name: Build ${{ matrix.platform }} (${{ matrix.cross }})
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -28,41 +42,42 @@ jobs:
           - { os: windows-latest, target: i686-pc-windows-msvc,        platform: win32-ia32,    cross: general }
           - { os: windows-latest, target: aarch64-pc-windows-msvc,     platform: win32-arm64,   cross: general }
     runs-on: ${{ matrix.os }}
-    env:
-      PACKAGE_ARGS: -p emmylua_ls -p emmylua_check -p emmylua_doc_cli -p emmylua_formatter
-      BINARY_NAMES: emmylua_ls emmylua_check emmylua_doc_cli luafmt
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.target }}-${{ matrix.cross }}
       - name: edit version
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: |
           echo "current ref ${{ github.ref }}"
-          cargo run -p edit_version -- ${{ github.ref }}
-      - name: Build - General
-        if: ${{ matrix.cross == 'general' }}
+          version="${GITHUB_REF_NAME#mewlua-v}"
+          cargo run -p edit_version -- "$version"
+      - name: Build
         shell: bash
         run: |
-          rustup target add ${{ matrix.target }}
-          cargo build --release --target ${{ matrix.target }} $PACKAGE_ARGS
-      - name: Build - cross
-        if: ${{ matrix.cross == 'cross' }}
-        shell: bash
-        run: |
-          cargo install cross
-          cross build --release --target ${{ matrix.target }} $PACKAGE_ARGS
-      - name: Build -zigbuild
-        if: ${{ matrix.cross == 'zigbuild' }}
-        shell: bash
-        run: |
-          rustup target add ${{ matrix.target }}
-          cargo install --locked cargo-zigbuild
-          pip3 install ziglang
-          cargo zigbuild --release --target ${{ matrix.target }}.${{ matrix.glibc }} $PACKAGE_ARGS
+          case "${{ matrix.cross }}" in
+            general)
+              rustup target add ${{ matrix.target }}
+              cargo build --release --target ${{ matrix.target }} $PACKAGE_ARGS
+              ;;
+            cross)
+              cargo install cross
+              cross build --release --target ${{ matrix.target }} $PACKAGE_ARGS
+              ;;
+            zigbuild)
+              rustup target add ${{ matrix.target }}
+              cargo install --locked cargo-zigbuild
+              pip3 install ziglang
+              cargo zigbuild --release --target ${{ matrix.target }}.${{ matrix.glibc }} $PACKAGE_ARGS
+              ;;
+          esac
       - name: Stage binaries
+        id: stage
         shell: bash
         run: |
           if [ "${{ matrix.cross }}" = "zigbuild" ]; then
@@ -72,6 +87,8 @@ jobs:
             artifact_platform="${{ matrix.platform }}"
             target_dir="${{ matrix.target }}"
           fi
+
+          echo "artifact_name=build-${artifact_platform}" >> "$GITHUB_OUTPUT"
 
           mkdir -p "$GITHUB_WORKSPACE/artifact"
           binaries=($BINARY_NAMES)
@@ -87,24 +104,22 @@ jobs:
             cp "$source_path" "$bundle_dir/"
           done
       - name: Upload
-        if: ${{ matrix.cross != 'zigbuild' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: build-${{ matrix.platform }}
+          name: ${{ steps.stage.outputs.artifact_name }}
           path: ${{ github.workspace }}/artifact/
-      - name: Upload zigbuild
-        if: ${{ matrix.cross == 'zigbuild' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-${{ matrix.platform }}-glibc.${{ matrix.glibc }}
-          path: ${{ github.workspace }}/artifact/
+          if-no-files-found: error
+          retention-days: 7
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 15
+    if: startsWith(github.ref, 'refs/tags/mewlua-v')
+    permissions:
+      contents: write
     steps:
       - name: Download
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
       - name: Compress artifacts
         shell: bash
         run: |
@@ -122,13 +137,11 @@ jobs:
             fi
           done
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          name: emmylua_ls
+          name: ${{ github.ref_name }}
           draft: false
           generate_release_notes: true
           files: |
             *.zip
             *.tar.gz
-
-          token: ${{ secrets.RELEASE }}
