@@ -1,11 +1,11 @@
-use hashbrown::HashMap;
+use indexmap::IndexMap;
 
 use crate::{LuaMemberIndexItem, LuaMemberKey};
 
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct LuaOwnerMembers {
-    members: HashMap<LuaMemberKey, LuaMemberIndexItem>,
+    members: IndexMap<LuaMemberKey, LuaMemberIndexItem>,
     resolve_state: OwnerMemberStatus,
 }
 
@@ -13,7 +13,7 @@ pub struct LuaOwnerMembers {
 impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
-            members: HashMap::new(),
+            members: IndexMap::new(),
             resolve_state: OwnerMemberStatus::UnResolved,
         }
     }
@@ -51,7 +51,7 @@ impl LuaOwnerMembers {
     }
 
     pub fn remove_member(&mut self, key: &LuaMemberKey) -> Option<LuaMemberIndexItem> {
-        self.members.remove(key)
+        self.members.shift_remove(key)
     }
 
     pub fn is_empty(&self) -> bool {

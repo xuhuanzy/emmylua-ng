@@ -577,6 +577,7 @@ dependencies = [
  "googletest",
  "hashbrown 0.17.1",
  "include_dir",
+ "indexmap 2.14.0",
  "internment",
  "itertools 0.14.0",
  "log",

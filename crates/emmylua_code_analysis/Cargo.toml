@@ -54,6 +54,7 @@ reqwest = { workspace = true, optional = true }
 schema_to_emmylua.workspace = true
 hashbrown.workspace = true
 rustc-hash.workspace = true
+indexmap.workspace = true
 
 [features]
 default = []
