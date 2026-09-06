@@ -2,8 +2,8 @@ use hashbrown::HashSet;
 
 use crate::{
     DbIndex, LuaGenericType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaType,
-    LuaTypeDecl, LuaTypeDeclId, TypeSubstitutor, complete_type_generic_args_in_type,
-    instantiate_type_generic, semantic::type_check::error_chain::not_assignable_message,
+    LuaTypeDeclId, TypeSubstitutor, complete_type_generic_args_in_type, instantiate_type_generic,
+    semantic::type_check::error_chain::not_assignable_message,
 };
 
 use super::super::{
@@ -11,153 +11,12 @@ use super::super::{
     sub_type::{get_base_type_id, is_sub_type_of},
 };
 use super::{
-    array::relate_keyed_source_to_array,
-    member::{
-        collect_missing_members, relate_index_member, relate_keyed_member,
-        unrelated_missing_members, visit_member_items,
-    },
-    object_type::{relate_member_to_table_generic, relate_to_object_target},
-    table_const::relate_to_table_const_target,
-    tuple::relate_keyed_source_to_tuple,
+    array::relate_array_to_declared_target,
+    member::{relate_members, visit_member_items},
+    tuple::relate_tuple_to_declared_target,
 };
 
-pub(super) fn relate_declared_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_id: &LuaTypeDeclId,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> Option<RelationResult> {
-    let Some(source_decl) = relater.db().get_type_index().get_type_decl(source_id) else {
-        return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-    };
-
-    if source_decl.is_alias() {
-        let Some(alias_origin) = source_decl.get_alias_ref() else {
-            return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-        };
-        return Some(relater.relate(alias_origin, target, intersection_state));
-    }
-
-    if source_decl.is_enum() {
-        Some(relate_enum_source(
-            relater,
-            source,
-            source_id,
-            source_decl,
-            target,
-            intersection_state,
-        ))
-    } else {
-        relate_class_source(relater, source, source_id, target, intersection_state)
-    }
-}
-
-fn relate_enum_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_id: &LuaTypeDeclId,
-    source_decl: &LuaTypeDecl,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    if matches!(target, LuaType::Ref(target_id) | LuaType::Def(target_id) if target_id == source_id)
-    {
-        return Ok(());
-    }
-
-    // enum Def 表示运行时声明表, 只额外保留宽 Table 与 TableGeneric 关系.
-    if matches!(source, LuaType::Def(_)) {
-        match target {
-            LuaType::Table => {
-                return Ok(());
-            }
-            LuaType::TableGeneric(target_params) => {
-                return relate_declared_to_table_generic(
-                    relater,
-                    source,
-                    target,
-                    target_params,
-                    intersection_state,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    let Some(enum_fields) = source_decl.get_enum_field_type(relater.db()) else {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    };
-
-    relater.relate(&enum_fields, target, intersection_state)
-}
-
-fn relate_class_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_id: &LuaTypeDeclId,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> Option<RelationResult> {
-    match target {
-        LuaType::Tuple(target_tuple) => Some(relate_keyed_source_to_tuple(
-            relater,
-            source,
-            target_tuple,
-            intersection_state,
-        )),
-        LuaType::Array(target_array) => Some(relate_keyed_source_to_array(
-            relater,
-            source,
-            target,
-            target_array,
-            intersection_state,
-        )),
-        LuaType::TableGeneric(target_params) => Some(relate_declared_to_table_generic(
-            relater,
-            source,
-            target,
-            target_params,
-            intersection_state,
-        )),
-        LuaType::Object(target_object) => Some(relate_to_object_target(
-            relater,
-            source,
-            target,
-            target_object,
-            intersection_state,
-        )),
-        LuaType::TableConst(target_range) => Some(relate_to_table_const_target(
-            relater,
-            source,
-            target,
-            target_range,
-            intersection_state,
-        )),
-        LuaType::Ref(target_id) | LuaType::Def(target_id) => {
-            Some(relate_nominal_source_to_declared_target(
-                relater,
-                source,
-                source_id,
-                target,
-                target_id,
-                intersection_state,
-            ))
-        }
-        LuaType::Generic(target_generic) => Some(relate_class_source_to_generic_target(
-            relater,
-            source,
-            source_id,
-            target,
-            target_generic,
-            intersection_state,
-        )),
-        LuaType::Table | LuaType::Userdata => Some(Ok(())),
-        _ => relate_class_source_to_simple_target(relater, source, source_id, target),
-    }
-}
-
-pub(super) fn relate_base_source_to_declared_target(
+pub(super) fn relate_to_declared_target(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
@@ -171,135 +30,17 @@ pub(super) fn relate_base_source_to_declared_target(
     let Some(target_decl) = relater.db().get_type_index().get_type_decl(target_id) else {
         return Some(relater.fail(|db| not_assignable_message(db, source, target)));
     };
-    if target_decl.is_alias() || target_decl.is_enum() {
-        return Some(relate_structural_source_to_declared_target(
-            relater,
-            source,
-            target,
-            intersection_state,
-        ));
-    }
 
-    // 类不允许继承基础类型
-    match source {
-        LuaType::Userdata | LuaType::Thread | LuaType::Global => {
-            if let Some(base_id) = get_base_type_id(source)
-                && is_sub_type_of(relater.db(), target_id, &base_id)
-            {
-                Some(Ok(()))
-            } else {
-                Some(relater.fail(|db| not_assignable_message(db, source, target)))
-            }
-        }
-        _ => None,
-    }
-}
-
-pub(super) fn relate_nominal_source_to_declared_target(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_id: &LuaTypeDeclId,
-    target: &LuaType,
-    target_id: &LuaTypeDeclId,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    let Some(target_decl) = relater.db().get_type_index().get_type_decl(target_id) else {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    };
-
-    if target_decl.is_alias() || target_decl.is_enum() {
-        return relate_structural_source_to_declared_target(
-            relater,
-            source,
-            target,
-            intersection_state,
-        );
-    }
-
-    if source_id == target_id {
-        return Ok(());
-    }
-
-    relate_to_declared_target_members(relater, source, target, intersection_state)
-}
-
-fn relate_class_source_to_generic_target(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_id: &LuaTypeDeclId,
-    target: &LuaType,
-    target_generic: &LuaGenericType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    let target_id = target_generic.get_base_type_id_ref();
-    let Some(target_decl) = relater.db().get_type_index().get_type_decl(target_id) else {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    };
-
-    if target_decl.is_alias() || target_decl.is_enum() {
-        return relate_structural_source_to_declared_target(
-            relater,
-            source,
-            target,
-            intersection_state,
-        );
-    }
-
-    let completed_source = complete_type_generic_args_in_type(relater.db(), source);
-    if completed_source != *source && matches!(completed_source, LuaType::Generic(_)) {
-        return relater.relate(&completed_source, target, intersection_state);
-    }
-
-    if source_id == target_id {
-        if target_generic.get_params().iter().all(|param| {
-            param.is_any() || matches!(param, LuaType::TplRef(_) | LuaType::StrTplRef(_))
-        }) {
-            return Ok(());
-        }
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    }
-
-    relate_to_declared_target_members(relater, source, target, intersection_state)
-}
-
-pub(super) fn relate_structural_source_to_declared_target(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    if let Some(result) =
-        resolve_declared_target_alias_or_enum(relater, source, target, intersection_state)
-    {
-        return result;
-    }
-
-    relate_to_declared_target_members(relater, source, target, intersection_state)
-}
-
-pub(super) fn resolve_declared_target_alias_or_enum(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> Option<RelationResult> {
-    let (target_id, substitutor) = match target {
-        LuaType::Ref(target_id) | LuaType::Def(target_id) => (target_id.clone(), None),
-        LuaType::Generic(target_generic) => (
-            target_generic.get_base_type_id(),
-            Some(TypeSubstitutor::from_alias(
+    if target_decl.is_alias() {
+        let target_substitutor = match target {
+            LuaType::Generic(target_generic) => Some(TypeSubstitutor::from_alias(
                 target_generic.get_params().clone(),
                 target_generic.get_base_type_id(),
             )),
-        ),
-        _ => return Some(relater.fail(|db| not_assignable_message(db, source, target))),
-    };
-    let Some(target_decl) = relater.db().get_type_index().get_type_decl(&target_id) else {
-        return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-    };
-
-    if target_decl.is_alias() {
-        let Some(origin_type) = target_decl.get_alias_origin(relater.db(), substitutor.as_ref())
+            _ => None,
+        };
+        let Some(origin_type) =
+            target_decl.get_alias_origin(relater.db(), target_substitutor.as_ref())
         else {
             return Some(relater.fail(|db| not_assignable_message(db, source, target)));
         };
@@ -332,77 +73,126 @@ pub(super) fn resolve_declared_target_alias_or_enum(
         return Some(relater.relate(source, &enum_fields, intersection_state));
     }
 
-    None
+    // 过滤非类形态的源
+    if !matches!(
+        source,
+        LuaType::Ref(_)
+            | LuaType::Def(_)
+            | LuaType::Generic(_)
+            | LuaType::Userdata
+            | LuaType::Thread
+            | LuaType::Global
+            | LuaType::Table
+            | LuaType::Array(_)
+            | LuaType::Tuple(_)
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::TableGeneric(_)
+            | LuaType::Intersection(_)
+    ) {
+        return None;
+    }
+
+    Some(relate_to_class_target(
+        relater,
+        source,
+        target,
+        target_id,
+        intersection_state,
+    ))
 }
 
-fn relate_class_source_to_simple_target(
+fn relate_to_class_target(
+    relater: &mut Relater,
+    source: &LuaType,
+    target: &LuaType,
+    target_id: &LuaTypeDeclId,
+    intersection_state: IntersectionState,
+) -> RelationResult {
+    match source {
+        LuaType::Table | LuaType::Global => Ok(()),
+        LuaType::Ref(source_id) | LuaType::Def(source_id) => {
+            if let LuaType::Generic(target_generic) = target {
+                relate_class_to_generic_target(
+                    relater,
+                    source,
+                    source_id,
+                    target,
+                    target_generic,
+                    intersection_state,
+                )
+            } else if is_same_decl(target, source_id) {
+                Ok(())
+            } else {
+                relate_members(relater, source, target, intersection_state)
+            }
+        }
+        LuaType::Generic(source_generic) => {
+            if is_same_decl(target, source_generic.get_base_type_id_ref()) {
+                Ok(())
+            } else {
+                relate_members(relater, source, target, intersection_state)
+            }
+        }
+        // 内置类型沿继承链判定.
+        LuaType::Thread | LuaType::Userdata => {
+            if let Some(base_id) = get_base_type_id(source)
+                && is_sub_type_of(relater.db(), target_id, &base_id)
+            {
+                Ok(())
+            } else {
+                relater.fail(|db| not_assignable_message(db, source, target))
+            }
+        }
+        LuaType::Array(source_array) => relate_array_to_declared_target(
+            relater,
+            source,
+            target,
+            source_array,
+            intersection_state,
+        ),
+        LuaType::Tuple(source_tuple) => relate_tuple_to_declared_target(
+            relater,
+            source,
+            target,
+            source_tuple,
+            intersection_state,
+        ),
+        LuaType::TableConst(_)
+        | LuaType::Object(_)
+        | LuaType::TableGeneric(_)
+        | LuaType::Intersection(_) => relate_members(relater, source, target, intersection_state),
+        _ => Ok(()),
+    }
+}
+
+fn is_same_decl(target: &LuaType, source_id: &LuaTypeDeclId) -> bool {
+    matches!(target, LuaType::Ref(target_id) | LuaType::Def(target_id) if target_id == source_id)
+}
+
+fn relate_class_to_generic_target(
     relater: &mut Relater,
     source: &LuaType,
     source_id: &LuaTypeDeclId,
     target: &LuaType,
-) -> Option<RelationResult> {
-    // string 在 std 内被定义为类, 因此我们需要豁免从 def -> string 的情况
-    match target {
-        LuaType::String | LuaType::StringConst(_) | LuaType::Integer | LuaType::IntegerConst(_) => {
-        }
-        _ => return None,
-    }
-
-    if let Some(target_base_id) = get_base_type_id(target)
-        && source_id == &target_base_id
-    {
-        return Some(Ok(()));
-    }
-
-    Some(relater.fail(|db| not_assignable_message(db, source, target)))
-}
-
-pub(in crate::semantic::type_check) fn relate_to_declared_target_members(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
+    target_generic: &LuaGenericType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
-    let target_id = match target {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(type_id),
-        LuaType::Generic(generic) => Some(generic.get_base_type_id_ref()),
-        _ => None,
-    };
-    if target_id.is_some_and(|type_id| {
-        relater
-            .db()
-            .get_type_index()
-            .get_type_decl(type_id)
-            .is_none()
-    }) {
+    let completed_source = complete_type_generic_args_in_type(relater.db(), source);
+    if completed_source != *source && matches!(completed_source, LuaType::Generic(_)) {
+        return relater.relate(&completed_source, target, intersection_state);
+    }
+
+    if source_id == target_generic.get_base_type_id_ref() {
+        if target_generic.get_params().iter().all(|param| {
+            param.is_any() || matches!(param, LuaType::TplRef(_) | LuaType::StrTplRef(_))
+        }) {
+            return Ok(());
+        }
         return relater.fail(|db| not_assignable_message(db, source, target));
     }
 
-    if relater.is_explain() {
-        let (missing_keys, _) =
-            collect_missing_members(relater, source, target, intersection_state)?;
-        if !missing_keys.is_empty() {
-            return unrelated_missing_members(relater, source, target, missing_keys);
-        }
-    }
-
-    visit_declared_members(relater, target, |relater, key, target_member_type| {
-        if let LuaMemberKey::TypeKey(target_key_type) = key {
-            if intersection_state.contains(IntersectionState::TARGET) {
-                return Ok(());
-            }
-            return relate_index_member(
-                relater,
-                source,
-                target,
-                target_key_type,
-                target_member_type,
-                intersection_state,
-            );
-        }
-
-        relate_keyed_member(relater, source, key, target_member_type, intersection_state)
-    })
+    relate_members(relater, source, target, intersection_state)
 }
 
 pub(super) fn visit_declared_members(
@@ -594,26 +384,4 @@ fn resolve_instantiated_member(
         }
     }
     Some((key, member_type))
-}
-
-pub(super) fn relate_declared_to_table_generic(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    target_params: &[LuaType],
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    if target_params.len() != 2 {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    }
-
-    visit_declared_members(relater, source, |relater, key, source_value_type| {
-        relate_member_to_table_generic(
-            relater,
-            key,
-            source_value_type,
-            target_params,
-            intersection_state,
-        )
-    })
 }

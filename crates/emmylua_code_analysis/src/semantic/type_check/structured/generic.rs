@@ -1,217 +1,21 @@
-use crate::{
-    LuaGenericType, LuaType, TypeSubstitutor,
-    semantic::type_check::error_chain::{ChainMessage, OverflowKind, not_assignable_message},
-};
+use crate::{LuaGenericType, LuaType};
 
 use super::super::relation::{IntersectionState, Relater, RelationFailure, RelationResult};
-use super::{
-    array::relate_keyed_source_to_array,
-    declared::{
-        relate_declared_to_table_generic, relate_nominal_source_to_declared_target,
-        relate_structural_source_to_declared_target, relate_to_declared_target_members,
-    },
-    object_type::relate_to_object_target,
-    table_const::relate_to_table_const_target,
-    tuple::relate_keyed_source_to_tuple,
-};
 
-pub(super) fn relate_generic_source(
+/// 同族泛型先比较实参, 返回 None 时仍需成员检查或别名展开来验证方差.
+pub(super) fn relate_same_family_generic_args(
     relater: &mut Relater,
-    source: &LuaType,
     source_generic: &LuaGenericType,
-    target: &LuaType,
+    target_generic: &LuaGenericType,
     intersection_state: IntersectionState,
 ) -> Option<RelationResult> {
-    let Some(source_decl) = relater
-        .db()
-        .get_type_index()
-        .get_type_decl(source_generic.get_base_type_id_ref())
-    else {
-        return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-    };
-
-    // todo: 实现完整的型变探测
-    // 基类型 id 相同时先按位置比较类型实参.
-    // 快捷尝试仅作探测, 因此需要保留快照.
-    let saved_chain = relater.error_chain_snapshot();
-    let args_outcome = if let LuaType::Generic(target_generic) = target
-        && source_generic.get_base_type_id_ref() == target_generic.get_base_type_id_ref()
-        && !source_decl.is_enum()
-    {
-        Some(relate_same_family_generic_args(
-            relater,
-            source_generic,
-            target_generic,
-            intersection_state,
-        ))
-    } else {
-        None
-    };
-
-    match args_outcome {
-        Some(SameFamilyArgsOutcome::Related) => return Some(Ok(())),
-        Some(SameFamilyArgsOutcome::Indeterminate(kind)) => {
-            return Some(Err(RelationFailure::Indeterminate(kind)));
-        }
-        // `Covariant` 仅表示实参按协变通过, 但对于泛型别名实参可能处于逆变/不变位置, 仍然需要交由后续流程展开验证.
-        Some(SameFamilyArgsOutcome::Covariant | SameFamilyArgsOutcome::Proceed) => {
-            relater.restore_error_chain(saved_chain);
-        }
-        None => {}
-    }
-
-    let result = if source_decl.is_alias() {
-        let substitutor = TypeSubstitutor::from_alias(
-            source_generic.get_params().clone(),
-            source_generic.get_base_type_id(),
-        );
-        match source_decl.get_alias_origin(relater.db(), Some(&substitutor)) {
-            Some(alias_origin) => Some(relater.relate(&alias_origin, target, intersection_state)),
-            None => {
-                return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-            }
-        }
-    } else if source_decl.is_class() {
-        match target {
-            LuaType::Tuple(target_tuple) => Some(relate_keyed_source_to_tuple(
-                relater,
-                source,
-                target_tuple,
-                intersection_state,
-            )),
-            LuaType::Array(target_array) => Some(relate_keyed_source_to_array(
-                relater,
-                source,
-                target,
-                target_array,
-                intersection_state,
-            )),
-            LuaType::TableGeneric(target_params) => Some(relate_declared_to_table_generic(
-                relater,
-                source,
-                target,
-                target_params,
-                intersection_state,
-            )),
-            LuaType::Object(target_object) => Some(relate_to_object_target(
-                relater,
-                source,
-                target,
-                target_object,
-                intersection_state,
-            )),
-            LuaType::TableConst(target_range) => Some(relate_to_table_const_target(
-                relater,
-                source,
-                target,
-                target_range,
-                intersection_state,
-            )),
-            LuaType::Ref(target_id) | LuaType::Def(target_id) => {
-                Some(relate_nominal_source_to_declared_target(
-                    relater,
-                    source,
-                    source_generic.get_base_type_id_ref(),
-                    target,
-                    target_id,
-                    intersection_state,
-                ))
-            }
-            LuaType::Generic(target_generic) => Some(relate_generic_source_to_generic_target(
-                relater,
-                source,
-                source_generic,
-                target,
-                target_generic,
-                intersection_state,
-            )),
-            LuaType::Table | LuaType::Userdata => Some(Ok(())),
-            _ => None,
-        }
-    } else {
-        return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-    };
-
-    result
-}
-
-fn relate_generic_source_to_generic_target(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_generic: &LuaGenericType,
-    target: &LuaType,
-    target_generic: &LuaGenericType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    let Some(target_decl) = relater
-        .db()
-        .get_type_index()
-        .get_type_decl(target_generic.get_base_type_id_ref())
-    else {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    };
-    if target_decl.is_alias() || target_decl.is_enum() {
-        return relate_structural_source_to_declared_target(
-            relater,
-            source,
-            target,
-            intersection_state,
-        );
-    }
-
-    // 同族泛型按位置比较类型实参
-    if source_generic.get_base_type_id_ref() == target_generic.get_base_type_id_ref() {
-        // TODO: 理论上可以移除, 因为泛型参数在分析时要么补全为 unknown 要么将整个变量视为 any
-        if source_generic.get_params().len() != target_generic.get_params().len() {
-            return relater.fail(|db| not_assignable_message(db, source, target));
-        }
-
-        return match relate_same_family_generic_args(
-            relater,
-            source_generic,
-            target_generic,
-            intersection_state,
-        ) {
-            SameFamilyArgsOutcome::Related => Ok(()),
-            SameFamilyArgsOutcome::Indeterminate(kind) => Err(RelationFailure::Indeterminate(kind)),
-            // 目前协变探测并不完善, 对于错误项仍然需要交由结构检查逐成员验证.
-            SameFamilyArgsOutcome::Covariant | SameFamilyArgsOutcome::Proceed => {
-                relate_to_declared_target_members(relater, source, target, intersection_state)
-            }
-        };
-    }
-
-    // 不同族时按目标成员做结构检查
-    relate_to_declared_target_members(relater, source, target, intersection_state)
-}
-
-/// 同族泛型实参快捷比较的结果
-enum SameFamilyArgsOutcome {
-    Related,
-    /// 实参按默认协变方向检查全部通过, 但仍需要进一步验证
-    Covariant,
-    /// 存在实参不兼容
-    Proceed,
-    Indeterminate(OverflowKind),
-}
-
-/// 基类型 id 相同时直接按位置比较类型实参, 不做结构展开.
-fn relate_same_family_generic_args(
-    relater: &mut Relater,
-    source_generic: &LuaGenericType,
-    target_generic: &LuaGenericType,
-    intersection_state: IntersectionState,
-) -> SameFamilyArgsOutcome {
     let source_params = source_generic.get_params();
     let target_params = target_generic.get_params();
     if source_params.len() != target_params.len() {
-        return SameFamilyArgsOutcome::Proceed;
+        return None;
     }
-    // 单实参失败时保留空 path, 诊断直接展示实参对比; 多实参需标注失配位置.
-    let locate_argument = source_params.len() > 1;
     let mut all_trivial = true;
-    for (index, (source_param, target_param)) in source_params.iter().zip(target_params).enumerate()
-    {
+    for (source_param, target_param) in source_params.iter().zip(target_params) {
         // 判定一对类型是否在任意方差位置都可互换, 不能用 `fast_eq_check`, 其在逆变位置会误放行.
         let trivial = source_param == target_param
             || matches!(source_param, LuaType::Any | LuaType::SelfInfer)
@@ -223,25 +27,15 @@ fn relate_same_family_generic_args(
             || matches!(target_param, LuaType::TplRef(tpl) if tpl.get_constraint().is_none());
         all_trivial &= trivial;
         if !trivial {
-            let result = relater.relate(source_param, target_param, intersection_state);
-            let result = if locate_argument {
-                relater.on_unrelated(result, |_| ChainMessage::GenericArgument { index })
-            } else {
-                result
-            };
-            match result {
+            match relater.relate(source_param, target_param, intersection_state) {
                 Err(RelationFailure::Indeterminate(kind)) => {
-                    return SameFamilyArgsOutcome::Indeterminate(kind);
+                    return Some(Err(RelationFailure::Indeterminate(kind)));
                 }
-                Err(RelationFailure::Unrelated) => return SameFamilyArgsOutcome::Proceed,
+                Err(RelationFailure::Unrelated) => return None,
                 Ok(()) => {}
             }
         }
     }
 
-    if all_trivial {
-        SameFamilyArgsOutcome::Related
-    } else {
-        SameFamilyArgsOutcome::Covariant
-    }
+    all_trivial.then_some(Ok(()))
 }

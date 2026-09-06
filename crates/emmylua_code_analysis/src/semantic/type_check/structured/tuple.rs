@@ -12,67 +12,10 @@ use super::super::{
 };
 use super::{
     array::effective_array_base,
-    declared::{resolve_declared_target_alias_or_enum, visit_declared_members},
-    member::{probe_missing_member, relate_index_member, unrelated_missing_members},
-    table_const::relate_to_table_const_target,
+    declared::visit_declared_members,
+    index::relate_index_member,
+    member::{probe_missing_member, unrelated_missing_members},
 };
-
-pub(super) fn relate_tuple_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_tuple: &LuaTupleType,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> Option<RelationResult> {
-    match target {
-        LuaType::Table => Some(Ok(())),
-        LuaType::Tuple(target_tuple) => Some(relate_tuple_to_tuple(
-            relater,
-            source_tuple,
-            target_tuple,
-            intersection_state,
-        )),
-        LuaType::Array(target_array) => Some(relate_tuple_to_array(
-            relater,
-            source_tuple,
-            target_array,
-            intersection_state,
-        )),
-        LuaType::TableGeneric(target_params) => Some(relate_tuple_to_table_generic(
-            relater,
-            source,
-            target,
-            source_tuple,
-            target_params,
-            intersection_state,
-        )),
-        LuaType::Object(target_object) => Some(relate_tuple_to_object(
-            relater,
-            source,
-            target,
-            source_tuple,
-            target_object,
-            intersection_state,
-        )),
-        LuaType::TableConst(target_range) => Some(relate_to_table_const_target(
-            relater,
-            source,
-            target,
-            target_range,
-            intersection_state,
-        )),
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-            Some(relate_tuple_to_declared_target(
-                relater,
-                source,
-                target,
-                source_tuple,
-                intersection_state,
-            ))
-        }
-        _ => None,
-    }
-}
 
 pub(super) fn relate_tuple_to_tuple(
     relater: &mut Relater,
@@ -165,28 +108,6 @@ pub(super) fn relate_tuple_to_array(
     Ok(())
 }
 
-pub(super) fn relate_tuple_to_table_generic(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    source_tuple: &LuaTupleType,
-    target_params: &[LuaType],
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    if target_params.len() != 2 {
-        return relater.fail(|db| not_assignable_message(db, source, target));
-    }
-
-    visit_tuple_index_entries(source_tuple, |key_type, source_type, index| {
-        relater.consume_relation_budget()?;
-        let key_result = relater.relate(key_type, &target_params[0], intersection_state);
-        relater.on_unrelated(key_result, |_| ChainMessage::GenericArgument { index: 0 })?;
-        let value_result = relater.relate(source_type, &target_params[1], intersection_state);
-        relater.on_unrelated(value_result, |_| ChainMessage::TupleElement { index })?;
-        Ok(())
-    })
-}
-
 /// 按真实索引遍历元组元素, 无界可变尾部使用抽象整数键.
 pub(super) fn visit_tuple_index_entries<E>(
     tuple: &LuaTupleType,
@@ -258,7 +179,7 @@ pub(super) fn relate_keyed_source_to_tuple(
     Ok(())
 }
 
-fn relate_tuple_to_object(
+pub(super) fn relate_tuple_to_object(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
@@ -269,7 +190,7 @@ fn relate_tuple_to_object(
     // 如果目标含有必需的非整数命名字段, 元组没有形状, 直接不兼容
     for (key, target_member_type) in target_object.get_fields() {
         if !matches!(key, LuaMemberKey::Integer(idx) if *idx > 0)
-            && !target_member_type.is_optional()
+            && !is_optional(relater.db(), target_member_type)
         {
             return relater.fail(|db| not_assignable_message(db, source, target));
         }
@@ -281,7 +202,7 @@ fn relate_tuple_to_object(
         };
         let index = (*idx - 1) as usize;
         let Some(source_type) = source_tuple.get_type(index) else {
-            if target_member_type.is_optional() {
+            if is_optional(relater.db(), target_member_type) {
                 continue;
             }
             return relater.fail(|db| not_assignable_message(db, source, target));
@@ -308,19 +229,14 @@ fn relate_tuple_to_object(
     Ok(())
 }
 
-fn relate_tuple_to_declared_target(
+/// 元组源对类目标应只匹配整数索引与索引访问
+pub(super) fn relate_tuple_to_declared_target(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
     source_tuple: &LuaTupleType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
-    if let Some(result) =
-        resolve_declared_target_alias_or_enum(relater, source, target, intersection_state)
-    {
-        return result;
-    }
-
     if relater.is_explain() {
         let mut missing_keys = Vec::new();
         visit_declared_members(relater, target, |relater, key, target_member_type| {

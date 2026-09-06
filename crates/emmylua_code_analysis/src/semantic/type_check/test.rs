@@ -747,6 +747,34 @@ mod test {
     }
 
     #[test]
+    fn test_recursive_object_aliases_close_the_active_relation() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@alias NodeA { value: string, next: NodeA }
+            ---@alias NodeB { value: string, next: NodeB }
+            ---@alias WrongNode { value: integer, next: WrongNode }
+            "#,
+        );
+        let source = ws.ty("NodeA");
+        let compatible = ws.ty("NodeB");
+        let incompatible = ws.ty("WrongNode");
+        let db = ws.analysis.compilation.get_db();
+        assert_eq!(
+            probe_assignable(db, &source, &compatible),
+            RelationOutcome::Related
+        );
+        assert_eq!(
+            check_assignable(db, &source, &compatible),
+            AssignabilityResult::Assignable
+        );
+        assert_eq!(
+            probe_assignable(db, &source, &incompatible),
+            RelationOutcome::Unrelated
+        );
+    }
+
+    #[test]
     fn test_generic_recursive_alias_accepts_expanded_origin_members() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -819,6 +847,27 @@ mod test {
             let object_ty = ws.ty("{ [1]: number, [2]: integer }?");
 
             assert!(ws.check_type(&object_ty, &object_ty));
+        }
+    }
+
+    #[test]
+    fn test_table_const_target_required_and_optional_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let target = ws.expr_ty("{ required = 1, optional = nil }");
+        let compatible = ws.ty("{ required: integer }");
+        let incompatible = ws.ty("{ required: string }");
+        let missing = ws.ty("{}");
+        let db = ws.analysis.compilation.get_db();
+
+        assert_eq!(
+            check_assignable(db, &compatible, &target),
+            AssignabilityResult::Assignable
+        );
+        for source in [&incompatible, &missing] {
+            assert!(matches!(
+                check_assignable(db, source, &target),
+                AssignabilityResult::NotAssignable(_)
+            ));
         }
     }
 
@@ -934,6 +983,22 @@ mod test {
 
         assert!(ws.check_type(&narrow_key, &wide_key));
         assert!(!ws.check_type(&wide_key, &narrow_key));
+    }
+
+    #[test]
+    fn test_table_generic_keys_are_stricter_than_object_indexes() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def("---@class NamedIndexSource\n---@field label integer");
+        let index_target = ws.ty("{ [integer]: number }");
+        let table_target = ws.ty("table<integer, number>");
+        for source in [
+            ws.ty("{ label: integer }"),
+            ws.ty("NamedIndexSource"),
+            ws.expr_ty("{ label = 1 }"),
+        ] {
+            assert!(ws.check_type(&source, &index_target));
+            assert!(!ws.check_type(&source, &table_target));
+        }
     }
 
     #[test]

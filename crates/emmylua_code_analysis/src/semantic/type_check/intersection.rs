@@ -4,7 +4,7 @@ use crate::{
 
 use super::{
     relation::{IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult},
-    structured::{relate_structured, relate_target_intersection_index_members},
+    structured::{dispatch_structured, relate_target_intersection_index_members},
 };
 
 pub(crate) fn relate_intersection(
@@ -100,7 +100,7 @@ fn relate_source_intersection(
     }
 
     // 结构 target 的成员与索引义务必须先检查完整 intersection, 不能由单个 constituent 跳过.
-    if let Some(result) = relate_structured(relater, source, target, outer_intersection_state) {
+    if let Some(result) = dispatch_structured(relater, source, target, outer_intersection_state) {
         return result;
     }
     if related {

@@ -1,16 +1,14 @@
 use crate::{
     DbIndex, LuaIntersectionType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaType,
     semantic::member::find_members_with_key,
-    semantic::type_check::error_chain::{
-        index_message, missing_members_message, not_assignable_message, property_message,
-    },
+    semantic::type_check::error_chain::{missing_members_message, property_message},
 };
 
 use super::super::{
     is_optional,
     relation::{IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult},
 };
-use super::{declared::visit_declared_members, tuple::visit_tuple_index_entries};
+use super::{declared::visit_declared_members, index::relate_index_member};
 
 pub(super) fn visit_member_items<E>(
     db: &DbIndex,
@@ -21,6 +19,73 @@ pub(super) fn visit_member_items<E>(
         return Ok(());
     };
     member_items.try_for_each(|(key, item)| visitor(key, item))
+}
+
+/// 访问对象, 常量表和声明类型的成员, 简单对象直接借用已有字段.
+#[inline]
+pub(super) fn visit_members(
+    relater: &mut Relater,
+    typ: &LuaType,
+    mut visitor: impl FnMut(&mut Relater, &LuaMemberKey, &LuaType) -> RelationResult,
+) -> RelationResult {
+    match typ {
+        LuaType::Object(object) => {
+            for (key, member_type) in object.get_fields() {
+                visitor(relater, key, member_type)?;
+            }
+            for (key_type, member_type) in object.get_index_access() {
+                visitor(
+                    relater,
+                    &LuaMemberKey::TypeKey(key_type.clone()),
+                    member_type,
+                )?;
+            }
+            Ok(())
+        }
+        LuaType::TableConst(range) => {
+            let db = relater.db();
+            visit_member_items(db, &LuaMemberOwner::Element(range.clone()), |key, item| {
+                visitor(relater, key, &item.resolve_type(db).unwrap_or(LuaType::Any))
+            })
+        }
+        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
+            visit_declared_members(relater, typ, visitor)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[inline]
+pub(in crate::semantic::type_check) fn relate_members(
+    relater: &mut Relater,
+    source: &LuaType,
+    target: &LuaType,
+    intersection_state: IntersectionState,
+) -> RelationResult {
+    if relater.is_explain() {
+        let (missing_keys, _) =
+            collect_missing_members(relater, source, target, intersection_state)?;
+        if !missing_keys.is_empty() {
+            return unrelated_missing_members(relater, source, target, missing_keys);
+        }
+    }
+
+    visit_members(relater, target, |relater, key, member_type| {
+        if let LuaMemberKey::TypeKey(key_type) = key {
+            if intersection_state.contains(IntersectionState::TARGET) {
+                return Ok(());
+            }
+            return relate_index_member(
+                relater,
+                source,
+                target,
+                key_type,
+                member_type,
+                intersection_state,
+            );
+        }
+        relate_keyed_member(relater, source, key, member_type, intersection_state)
+    })
 }
 
 pub(super) fn relate_keyed_member(
@@ -42,8 +107,7 @@ pub(super) fn relate_keyed_member(
         });
     };
 
-    let field_result =
-        relater.relate_field_types(&source_member_type, target_member_type, intersection_state);
+    let field_result = relater.relate(&source_member_type, target_member_type, intersection_state);
     relater.on_unrelated(field_result, |_| property_message(key))
 }
 
@@ -95,105 +159,6 @@ pub(super) fn find_source_member_type(
     Ok(member_type)
 }
 
-pub(super) fn relate_index_member(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    target_key_type: &LuaType,
-    target_value_type: &LuaType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    // SOURCE 表示当前关系位于源交集的组成类型分支, 目标索引签名不参与该分支的关系判定.
-    if intersection_state.contains(IntersectionState::SOURCE) {
-        return Ok(());
-    }
-
-    let relate_entry = |relater: &mut Relater,
-                        source_key_type: &LuaType,
-                        source_value_type: &LuaType,
-                        require_compatible_key: bool|
-     -> RelationResult {
-        relater.consume_relation_budget()?;
-        match relater.probe_relation(source_key_type, target_key_type, intersection_state) {
-            RelationOutcome::Related => {
-                let result =
-                    relater.relate(source_value_type, target_value_type, intersection_state);
-                relater.on_unrelated(result, |db| index_message(db, source_key_type))?;
-                Ok(())
-            }
-            RelationOutcome::Unrelated if !require_compatible_key => Ok(()),
-            RelationOutcome::Unrelated => {
-                relater.fail(|db| not_assignable_message(db, source, target))
-            }
-            RelationOutcome::Indeterminate(kind) => Err(RelationFailure::Indeterminate(kind)),
-        }
-    };
-
-    match source {
-        LuaType::Object(source_object) => {
-            for (key, source_value_type) in source_object.get_fields() {
-                let Some(source_key_type) = key.to_index_type() else {
-                    continue;
-                };
-                relate_entry(relater, &source_key_type, source_value_type, false)?;
-            }
-            for (source_key_type, source_value_type) in source_object.get_index_access() {
-                relate_entry(relater, source_key_type, source_value_type, false)?;
-            }
-        }
-        LuaType::TableConst(range) => {
-            let owner = LuaMemberOwner::Element(range.clone());
-            let db = relater.db();
-            visit_member_items(db, &owner, |key, item| {
-                let Some(source_key_type) = key.to_index_type() else {
-                    return Ok(());
-                };
-                let source_value_type = item.resolve_type(db).unwrap_or(LuaType::Any);
-                relate_entry(relater, &source_key_type, &source_value_type, false)
-            })?;
-        }
-        LuaType::Tuple(source_tuple) => {
-            visit_tuple_index_entries(source_tuple, |key_type, source_value_type, _| {
-                relate_entry(
-                    relater,
-                    key_type,
-                    source_value_type,
-                    matches!(key_type, LuaType::Integer),
-                )
-            })?;
-        }
-        LuaType::Array(source_array) => {
-            relate_entry(relater, &LuaType::Integer, source_array.get_base(), false)?;
-        }
-        LuaType::TableGeneric(source_params) if source_params.len() == 2 => {
-            relate_entry(relater, &source_params[0], &source_params[1], false)?;
-        }
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-            visit_declared_members(relater, source, |relater, key, source_value_type| {
-                let Some(source_key_type) = key.to_index_type() else {
-                    return Ok(());
-                };
-                relate_entry(relater, &source_key_type, source_value_type, false)
-            })?;
-        }
-        LuaType::Intersection(intersection) => {
-            for member in intersection.get_types() {
-                relate_index_member(
-                    relater,
-                    member,
-                    target,
-                    target_key_type,
-                    target_value_type,
-                    intersection_state,
-                )?;
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
 pub(in crate::semantic::type_check) fn relate_target_intersection_index_members(
     relater: &mut Relater,
     source: &LuaType,
@@ -201,57 +166,23 @@ pub(in crate::semantic::type_check) fn relate_target_intersection_index_members(
     intersection: &LuaIntersectionType,
 ) -> RelationResult {
     for member in intersection.get_types() {
-        match member {
-            LuaType::Object(object) => {
-                for (key_type, value_type) in object.get_index_access() {
-                    relate_index_member(
-                        relater,
-                        source,
-                        target,
-                        key_type,
-                        value_type,
-                        IntersectionState::NONE,
-                    )?;
-                }
-            }
-            LuaType::TableConst(range) => {
-                let owner = LuaMemberOwner::Element(range.clone());
-                let db = relater.db();
-                visit_member_items(db, &owner, |key, item| {
-                    let LuaMemberKey::TypeKey(key_type) = key else {
-                        return Ok(());
-                    };
-                    let value_type = item.resolve_type(db).unwrap_or(LuaType::Any);
-                    relate_index_member(
-                        relater,
-                        source,
-                        target,
-                        key_type,
-                        &value_type,
-                        IntersectionState::NONE,
-                    )
-                })?;
-            }
-            LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-                visit_declared_members(relater, member, |relater, key, value_type| {
-                    let LuaMemberKey::TypeKey(key_type) = key else {
-                        return Ok(());
-                    };
-                    relate_index_member(
-                        relater,
-                        source,
-                        target,
-                        key_type,
-                        value_type,
-                        IntersectionState::NONE,
-                    )
-                })?;
-            }
-            LuaType::Intersection(nested) => {
-                relate_target_intersection_index_members(relater, source, target, nested)?;
-            }
-            _ => {}
+        if let LuaType::Intersection(nested) = member {
+            relate_target_intersection_index_members(relater, source, target, nested)?;
+            continue;
         }
+        visit_members(relater, member, |relater, key, value_type| {
+            let LuaMemberKey::TypeKey(key_type) = key else {
+                return Ok(());
+            };
+            relate_index_member(
+                relater,
+                source,
+                target,
+                key_type,
+                value_type,
+                IntersectionState::NONE,
+            )
+        })?;
     }
     Ok(())
 }
@@ -265,45 +196,32 @@ pub(in crate::semantic::type_check) fn collect_missing_members(
 ) -> Result<(Vec<LuaMemberKey>, bool), RelationFailure> {
     let mut missing_keys = Vec::new();
     let mut has_shared_key = false;
-    match target {
-        LuaType::Object(object) => {
-            for (key, member_type) in object.get_fields() {
-                if find_source_member_type(relater, source, key, intersection_state)?.is_some() {
-                    has_shared_key = true;
-                } else if !is_optional(relater.db(), member_type) {
-                    missing_keys.push(key.clone());
-                }
+    if let LuaType::TableConst(range) = target {
+        let db = relater.db();
+        // 只有缺失字段才需要解析目标类型来判断是否可空.
+        visit_member_items(db, &LuaMemberOwner::Element(range.clone()), |key, item| {
+            if matches!(key, LuaMemberKey::TypeKey(_)) {
+                return Ok(());
             }
-        }
-        LuaType::TableConst(range) => {
-            let owner = LuaMemberOwner::Element(range.clone());
-            let db = relater.db();
-            visit_member_items(db, &owner, |key, item| {
-                if matches!(key, LuaMemberKey::TypeKey(_)) {
-                    return Ok(());
-                }
-                if find_source_member_type(relater, source, key, intersection_state)?.is_some() {
-                    has_shared_key = true;
-                } else if !is_optional(db, &item.resolve_type(db).unwrap_or(LuaType::Any)) {
-                    missing_keys.push(key.clone());
-                }
-                Ok(())
-            })?;
-        }
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-            visit_declared_members(relater, target, |relater, key, member_type| {
-                if matches!(key, LuaMemberKey::TypeKey(_)) {
-                    return Ok(());
-                }
-                if find_source_member_type(relater, source, key, intersection_state)?.is_some() {
-                    has_shared_key = true;
-                } else if !is_optional(relater.db(), member_type) {
-                    missing_keys.push(key.clone());
-                }
-                Ok(())
-            })?;
-        }
-        _ => {}
+            if find_source_member_type(relater, source, key, intersection_state)?.is_some() {
+                has_shared_key = true;
+            } else if !is_optional(db, &item.resolve_type(db).unwrap_or(LuaType::Any)) {
+                missing_keys.push(key.clone());
+            }
+            Ok(())
+        })?;
+    } else {
+        visit_members(relater, target, |relater, key, member_type| {
+            if matches!(key, LuaMemberKey::TypeKey(_)) {
+                return Ok(());
+            }
+            if find_source_member_type(relater, source, key, intersection_state)?.is_some() {
+                has_shared_key = true;
+            } else if !is_optional(relater.db(), member_type) {
+                missing_keys.push(key.clone());
+            }
+            Ok(())
+        })?;
     }
     Ok((missing_keys, has_shared_key))
 }

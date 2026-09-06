@@ -8,68 +8,7 @@ use super::super::{
     is_optional,
     relation::{IntersectionState, Relater, RelationResult},
 };
-use super::{
-    declared::{resolve_declared_target_alias_or_enum, visit_declared_members},
-    member::relate_index_member,
-    table_const::relate_to_table_const_target,
-};
-
-pub(super) fn relate_array_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    source_array: &LuaArrayType,
-    target: &LuaType,
-    intersection_state: IntersectionState,
-) -> Option<RelationResult> {
-    match target {
-        LuaType::Table => Some(Ok(())),
-        LuaType::Array(target_array) => Some(relate_array_to_array(
-            relater,
-            source_array,
-            target_array,
-            intersection_state,
-        )),
-        LuaType::Tuple(target_tuple) => Some(relate_array_to_tuple(
-            relater,
-            source_array,
-            target_tuple,
-            intersection_state,
-        )),
-        LuaType::TableGeneric(target_params) => Some(relate_array_to_table_generic(
-            relater,
-            source,
-            target,
-            source_array,
-            target_params,
-            intersection_state,
-        )),
-        LuaType::Object(target_object) => Some(relate_array_to_object(
-            relater,
-            source,
-            target,
-            source_array,
-            target_object,
-            intersection_state,
-        )),
-        LuaType::TableConst(target_range) => Some(relate_to_table_const_target(
-            relater,
-            source,
-            target,
-            target_range,
-            intersection_state,
-        )),
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-            Some(relate_array_to_declared_target(
-                relater,
-                source,
-                target,
-                source_array,
-                intersection_state,
-            ))
-        }
-        _ => None,
-    }
-}
+use super::{declared::visit_declared_members, index::relate_index_member};
 
 #[inline(always)]
 pub(in crate::semantic::type_check) fn relate_array_to_array(
@@ -154,27 +93,20 @@ pub(super) fn relate_array_to_tuple(
     Ok(())
 }
 
-pub(super) fn relate_array_to_table_generic(
+pub(super) fn relate_table_generic_to_array(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
-    source_array: &LuaArrayType,
-    target_params: &[LuaType],
+    source_params: &[LuaType],
+    target_array: &LuaArrayType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
-    if target_params.len() != 2 {
+    if source_params.len() != 2 || (!source_params[0].is_integer() && !source_params[0].is_any()) {
         return relater.fail(|db| not_assignable_message(db, source, target));
     }
-
-    let key_result = relater.relate(&LuaType::Integer, &target_params[0], intersection_state);
-    relater.on_unrelated(key_result, |_| ChainMessage::GenericArgument { index: 0 })?;
-    let value_result = relater.relate(
-        source_array.get_base(),
-        &target_params[1],
-        intersection_state,
-    );
-    relater.on_unrelated(value_result, |_| ChainMessage::GenericArgument { index: 1 })?;
-    Ok(())
+    let target_base = effective_array_base(relater, target_array.get_base());
+    let result = relater.relate(&source_params[1], &target_base, intersection_state);
+    relater.on_unrelated(result, |_| ChainMessage::ArrayElement)
 }
 
 pub(super) fn relate_keyed_source_to_array(
@@ -202,7 +134,7 @@ pub(super) fn relate_keyed_source_to_array(
     Ok(())
 }
 
-fn relate_array_to_object(
+pub(super) fn relate_array_to_object(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
@@ -226,7 +158,7 @@ fn relate_array_to_object(
                 relater.on_unrelated(result, |_| ChainMessage::ArrayElement)?;
             }
             _ => {
-                if !member_type.is_optional() {
+                if !is_optional(relater.db(), member_type) {
                     return relater.fail(|db| not_assignable_message(db, source, target));
                 }
             }
@@ -250,19 +182,14 @@ fn relate_array_to_object(
     Ok(())
 }
 
-fn relate_array_to_declared_target(
+/// 数组源对类目标: 只核对整数索引与索引访问义务.
+pub(super) fn relate_array_to_declared_target(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
     source_array: &LuaArrayType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
-    if let Some(result) =
-        resolve_declared_target_alias_or_enum(relater, source, target, intersection_state)
-    {
-        return result;
-    }
-
     // 检查是否有整数索引或索引访问, 如果没有, 则不兼容
     let mut has_integer_or_index = false;
     let result =
@@ -302,7 +229,7 @@ fn relate_array_to_declared_target(
                     )
                 }
                 _ => {
-                    if !target_member_type.is_optional() {
+                    if !is_optional(relater.db(), target_member_type) {
                         return relater.fail(|db| not_assignable_message(db, source, target));
                     }
                     Ok(())

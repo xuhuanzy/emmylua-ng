@@ -1,25 +1,15 @@
-use crate::{LuaType, VariadicType, semantic::type_check::error_chain::not_assignable_message};
+use crate::{LuaType, semantic::type_check::error_chain::not_assignable_message};
 
-use super::relation::{IntersectionState, Relater, RelationResult};
+use super::relation::{Relater, RelationResult};
 
 #[inline(always)]
-pub(crate) fn relate_simple<const EARLY: bool>(
+pub(crate) fn relate_simple(
     relater: &mut Relater,
     source: &LuaType,
     target: &LuaType,
-    intersection_state: IntersectionState,
 ) -> Option<RelationResult> {
-    let conditional_extends = false;
     let (can_reject_simple_target_early, related) = match source {
-        LuaType::Unknown => {
-            if !conditional_extends {
-                return Some(Ok(()));
-            }
-            if !EARLY {
-                return Some(relater.fail(|db| not_assignable_message(db, source, target)));
-            }
-            (false, false)
-        }
+        LuaType::Unknown => return Some(Ok(())),
         LuaType::Boolean => (
             true,
             matches!(target, LuaType::Boolean | LuaType::BooleanConst(_)),
@@ -98,76 +88,14 @@ pub(crate) fn relate_simple<const EARLY: bool>(
             (false, matches!(target, LuaType::Function))
         }
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => (false, false),
-        LuaType::Variadic(source_variadic) => {
-            if !EARLY {
-                return Some(relate_variadic_source(
-                    relater,
-                    source,
-                    target,
-                    source_variadic.as_ref(),
-                    intersection_state,
-                ));
-            }
-            (false, false)
-        }
         _ => (false, false),
     };
-
-    if conditional_extends {
-        match target {
-            LuaType::StringConst(target_value) | LuaType::DocStringConst(target_value)
-                if matches!(
-                    source,
-                    LuaType::StringConst(source_value) | LuaType::DocStringConst(source_value)
-                        if source_value == target_value
-                ) =>
-            {
-                return Some(Ok(()));
-            }
-            LuaType::IntegerConst(target_value) | LuaType::DocIntegerConst(target_value)
-                if matches!(
-                    source,
-                    LuaType::IntegerConst(source_value) | LuaType::DocIntegerConst(source_value)
-                        if source_value == target_value
-                ) =>
-            {
-                return Some(Ok(()));
-            }
-            LuaType::BooleanConst(target_value) | LuaType::DocBooleanConst(target_value)
-                if matches!(
-                    source,
-                    LuaType::BooleanConst(source_value) | LuaType::DocBooleanConst(source_value)
-                        if source_value == target_value
-                ) =>
-            {
-                return Some(Ok(()));
-            }
-            LuaType::FloatConst(target_value) if matches!(source, LuaType::FloatConst(source_value) if source_value == target_value) =>
-            {
-                return Some(Ok(()));
-            }
-            LuaType::StringConst(_)
-            | LuaType::DocStringConst(_)
-            | LuaType::IntegerConst(_)
-            | LuaType::DocIntegerConst(_)
-            | LuaType::BooleanConst(_)
-            | LuaType::DocBooleanConst(_)
-            | LuaType::FloatConst(_) => {
-                return if can_reject_simple_target_early || !EARLY {
-                    Some(relater.fail(|db| not_assignable_message(db, source, target)))
-                } else {
-                    None
-                };
-            }
-            _ => {}
-        }
-    }
 
     if related {
         return Some(Ok(()));
     }
 
-    // 终端 source 可在入口阶段结束简单目标失败, 其他 source 仅在完整链路末端处理.
+    // source 可在入口阶段失败简单目标
     match target {
         LuaType::Nil
         | LuaType::Table
@@ -190,40 +118,10 @@ pub(crate) fn relate_simple<const EARLY: bool>(
         | LuaType::DocBooleanConst(_)
         | LuaType::StrTplRef(_)
         | LuaType::Language(_)
-            if can_reject_simple_target_early || !EARLY =>
+            if can_reject_simple_target_early =>
         {
             Some(relater.fail(|db| not_assignable_message(db, source, target)))
         }
         _ => None,
-    }
-}
-
-fn relate_variadic_source(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-    source_variadic: &VariadicType,
-    intersection_state: IntersectionState,
-) -> RelationResult {
-    match source_variadic {
-        VariadicType::Base(source_base) => match target {
-            LuaType::Variadic(target_variadic) => match target_variadic.as_ref() {
-                VariadicType::Base(target_base) => {
-                    if source_base == target_base {
-                        Ok(())
-                    } else {
-                        relater.fail(|db| not_assignable_message(db, source, target))
-                    }
-                }
-                VariadicType::Multi(target_types) => {
-                    for target_type in target_types {
-                        relater.relate(source_base, target_type, intersection_state)?;
-                    }
-                    Ok(())
-                }
-            },
-            _ => relater.relate(source_base, target, intersection_state),
-        },
-        VariadicType::Multi(_) => Ok(()),
     }
 }

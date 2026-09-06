@@ -52,15 +52,13 @@ pub fn check_assignable(db: &DbIndex, source: &LuaType, target: &LuaType) -> Ass
     RelationSession::explain(db, source, target)
 }
 
-// o(1) 复杂度
+#[inline]
 pub fn fast_eq_check(source: &LuaType, target: &LuaType) -> bool {
     match (source, target) {
+        (LuaType::Ref(a) | LuaType::Def(a), LuaType::Ref(b) | LuaType::Def(b)) => a == b,
         (LuaType::Any, _) => true,
         (_, LuaType::Any | LuaType::Unknown) => true,
         (LuaType::SelfInfer, _) | (_, LuaType::SelfInfer) => true,
-        (LuaType::TplRef(tpl), _) | (_, LuaType::TplRef(tpl)) if tpl.get_constraint().is_none() => {
-            true
-        }
         (LuaType::Nil, LuaType::Nil)
         | (LuaType::Table, LuaType::Table)
         | (LuaType::Userdata, LuaType::Userdata)
@@ -74,56 +72,84 @@ pub fn fast_eq_check(source: &LuaType, target: &LuaType) -> bool {
         | (LuaType::Global, LuaType::Global)
         | (LuaType::Never, LuaType::Never) => true,
         (
-            LuaType::BooleanConst(source_value) | LuaType::DocBooleanConst(source_value),
-            LuaType::BooleanConst(target_value) | LuaType::DocBooleanConst(target_value),
-        ) => source_value == target_value,
+            LuaType::BooleanConst(a) | LuaType::DocBooleanConst(a),
+            LuaType::BooleanConst(b) | LuaType::DocBooleanConst(b),
+        ) => a == b,
         (
-            LuaType::StringConst(source_value) | LuaType::DocStringConst(source_value),
-            LuaType::StringConst(target_value) | LuaType::DocStringConst(target_value),
-        ) => source_value == target_value,
+            LuaType::StringConst(a) | LuaType::DocStringConst(a),
+            LuaType::StringConst(b) | LuaType::DocStringConst(b),
+        ) => a == b,
         (
-            LuaType::IntegerConst(source_value) | LuaType::DocIntegerConst(source_value),
-            LuaType::IntegerConst(target_value) | LuaType::DocIntegerConst(target_value),
-        ) => source_value == target_value,
-        (LuaType::FloatConst(source_value), LuaType::FloatConst(target_value)) => {
-            source_value == target_value
-        }
-        (LuaType::TableConst(source_id), LuaType::TableConst(target_id)) => source_id == target_id,
-        (
-            LuaType::Ref(source_id) | LuaType::Def(source_id),
-            LuaType::Ref(target_id) | LuaType::Def(target_id),
-        ) => source_id == target_id,
-        (LuaType::Ref(source_id), LuaType::Union(union)) => matches!(
-            union.as_ref(),
-            LuaUnionType::Nullable(LuaType::Ref(target_id)) if source_id == target_id
+            LuaType::IntegerConst(a) | LuaType::DocIntegerConst(a),
+            LuaType::IntegerConst(b) | LuaType::DocIntegerConst(b),
+        ) => a == b,
+        (LuaType::FloatConst(a), LuaType::FloatConst(b)) => a == b,
+        (LuaType::TableConst(a), LuaType::TableConst(b)) => a == b,
+        (LuaType::Ref(a), LuaType::Union(b)) => matches!(
+            b.as_ref(),
+            LuaUnionType::Nullable(LuaType::Ref(b)) if a == b
         ),
-        (LuaType::Array(source), LuaType::Array(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Tuple(source), LuaType::Tuple(target)) => Arc::ptr_eq(source, target),
-        (LuaType::DocFunction(source), LuaType::DocFunction(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Object(source), LuaType::Object(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Union(source), LuaType::Union(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Intersection(source), LuaType::Intersection(target)) => {
-            Arc::ptr_eq(source, target)
+        (LuaType::Array(a), LuaType::Array(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Tuple(a), LuaType::Tuple(b)) => Arc::ptr_eq(a, b),
+        (LuaType::DocFunction(a), LuaType::DocFunction(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Object(a), LuaType::Object(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Union(a), LuaType::Union(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Intersection(a), LuaType::Intersection(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Generic(a), LuaType::Generic(b)) => Arc::ptr_eq(a, b) || a == b,
+        (LuaType::TableGeneric(a), LuaType::TableGeneric(b)) => Arc::ptr_eq(a, b),
+        (LuaType::TplRef(a), LuaType::TplRef(b)) => Arc::ptr_eq(a, b),
+        (LuaType::StrTplRef(a), LuaType::StrTplRef(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Variadic(a), LuaType::Variadic(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Signature(a), LuaType::Signature(b)) => a == b,
+        (LuaType::Instance(a), LuaType::Instance(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Namespace(a), LuaType::Namespace(b)) => a == b,
+        (LuaType::Call(a), LuaType::Call(b)) => Arc::ptr_eq(a, b),
+        (LuaType::MultiLineUnion(a), LuaType::MultiLineUnion(b)) => Arc::ptr_eq(a, b),
+        (LuaType::TypeGuard(a), LuaType::TypeGuard(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Language(a), LuaType::Language(b)) => a == b,
+        (LuaType::ModuleRef(a), LuaType::ModuleRef(b)) => a == b,
+        (LuaType::TplRef(a), _) | (_, LuaType::TplRef(a)) if a.get_constraint().is_none() => true,
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn accept_reflexive_or_semantic(source: &LuaType, target: &LuaType) -> bool {
+    match (source, target) {
+        (LuaType::Any, _)
+        | (_, LuaType::Any | LuaType::Unknown)
+        | (LuaType::SelfInfer, _)
+        | (_, LuaType::SelfInfer) => true,
+        (LuaType::Ref(a) | LuaType::Def(a), LuaType::Ref(b) | LuaType::Def(b)) => a == b,
+        (LuaType::Object(a), LuaType::Object(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Union(a), LuaType::Union(b)) => Arc::ptr_eq(a, b),
+        (LuaType::MultiLineUnion(a), LuaType::MultiLineUnion(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Array(a), LuaType::Array(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Tuple(a), LuaType::Tuple(b)) => Arc::ptr_eq(a, b),
+        (LuaType::DocFunction(a), LuaType::DocFunction(b)) => Arc::ptr_eq(a, b),
+        (LuaType::Generic(a), LuaType::Generic(b)) => Arc::ptr_eq(a, b),
+        (LuaType::TableGeneric(a), LuaType::TableGeneric(b)) => Arc::ptr_eq(a, b),
+        (LuaType::TableConst(a), LuaType::TableConst(b)) => a == b,
+        (
+            LuaType::StringConst(a) | LuaType::DocStringConst(a),
+            LuaType::StringConst(b) | LuaType::DocStringConst(b),
+        ) => a == b,
+        (
+            LuaType::IntegerConst(a) | LuaType::DocIntegerConst(a),
+            LuaType::IntegerConst(b) | LuaType::DocIntegerConst(b),
+        ) => a == b,
+        (
+            LuaType::BooleanConst(a) | LuaType::DocBooleanConst(a),
+            LuaType::BooleanConst(b) | LuaType::DocBooleanConst(b),
+        ) => a == b,
+        (LuaType::Signature(a), LuaType::Signature(b)) => a == b,
+        (LuaType::Namespace(a), LuaType::Namespace(b)) => a == b,
+        (LuaType::ModuleRef(a), LuaType::ModuleRef(b)) => a == b,
+        (LuaType::Language(a), LuaType::Language(b)) => a == b,
+        (LuaType::StrTplRef(a), LuaType::StrTplRef(b)) => Arc::ptr_eq(a, b),
+        (LuaType::TplRef(tpl), _) | (_, LuaType::TplRef(tpl)) if tpl.get_constraint().is_none() => {
+            true
         }
-        (LuaType::Generic(source), LuaType::Generic(target)) => {
-            Arc::ptr_eq(source, target) || source == target
-        }
-        (LuaType::TableGeneric(source), LuaType::TableGeneric(target)) => {
-            Arc::ptr_eq(source, target)
-        }
-        (LuaType::TplRef(source), LuaType::TplRef(target)) => Arc::ptr_eq(source, target),
-        (LuaType::StrTplRef(source), LuaType::StrTplRef(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Variadic(source), LuaType::Variadic(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Signature(source_id), LuaType::Signature(target_id)) => source_id == target_id,
-        (LuaType::Instance(source), LuaType::Instance(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Namespace(source_id), LuaType::Namespace(target_id)) => source_id == target_id,
-        (LuaType::Call(source), LuaType::Call(target)) => Arc::ptr_eq(source, target),
-        (LuaType::MultiLineUnion(source), LuaType::MultiLineUnion(target)) => {
-            Arc::ptr_eq(source, target)
-        }
-        (LuaType::TypeGuard(source), LuaType::TypeGuard(target)) => Arc::ptr_eq(source, target),
-        (LuaType::Language(source_id), LuaType::Language(target_id)) => source_id == target_id,
-        (LuaType::ModuleRef(source_id), LuaType::ModuleRef(target_id)) => source_id == target_id,
         _ => false,
     }
 }

@@ -1,22 +1,22 @@
 use std::sync::Arc;
 
 use crate::{
-    DbIndex, LuaType, LuaUnionType,
+    DbIndex, LuaArrayType, LuaObjectType, LuaType, LuaUnionType,
     semantic::type_check::{
         error_chain::{
             ChainMessage, ErrorChain, OverflowKind, not_assignable_message, push_message,
         },
         fast_eq_check, normalize_type,
-        structured::relate_array_to_array,
     },
 };
 
 use super::{
-    callable::relate_callable,
+    accept_reflexive_or_semantic,
     intersection::relate_intersection,
-    is_circular_tpl_constraint,
     simple::relate_simple,
-    structured::{relate_structured, relate_to_declared_target_members, relate_to_object_target},
+    structured::{
+        dispatch_structured, relate_array_to_array, relate_members, relate_object_to_object,
+    },
     union::relate_union,
 };
 
@@ -162,232 +162,60 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         target: &LuaType,
         intersection_state: IntersectionState,
     ) -> RelationResult {
-        self.relate_with::<false>(source, target, intersection_state, false)
-    }
-
-    /// `FIELD` 控制字段是否走快速路径
-    #[inline(always)]
-    fn relate_with<const FIELD: bool>(
-        &mut self,
-        source: &LuaType,
-        target: &LuaType,
-        intersection_state: IntersectionState,
-        guarded: bool,
-    ) -> RelationResult {
-        if guarded {
-            self.relate_guarded::<FIELD>(source, target, intersection_state)
-        } else {
-            self.relate_unguarded::<FIELD>(source, target, intersection_state)
-        }
-    }
-
-    fn relate_unguarded<const FIELD: bool>(
-        &mut self,
-        source: &LuaType,
-        target: &LuaType,
-        intersection_state: IntersectionState,
-    ) -> RelationResult {
-        if relate_semantic_accept(source, target) {
+        if accept_reflexive_or_semantic(source, target) {
             return Ok(());
         }
 
-        // 一些高频结构需要在此提前处理以提高性能
-        // source_requires_scope 表示是否创建作用域
-        // allow_structured_fast_path 表示是否允许结构化类型的快速路径
-        let (source_requires_scope, allow_structured_fast_path) = match source {
-            LuaType::Array(source_array) => {
-                if let LuaType::Array(target_array) = target {
-                    return self.run_fast_path(|relater| {
-                        relate_array_to_array(
-                            relater,
-                            source_array,
-                            target_array,
-                            intersection_state,
-                        )
-                    });
-                }
-                (false, FIELD)
-            }
-            LuaType::TableConst(_) | LuaType::Object(_) => {
-                if let LuaType::Object(target_object) = target {
-                    return self.run_fast_path(|relater| {
-                        relate_to_object_target(
-                            relater,
-                            source,
-                            target,
-                            target_object,
-                            intersection_state,
-                        )
-                    });
-                }
-                (false, true)
-            }
-            LuaType::Ref(source_id) | LuaType::Def(source_id) => (
-                true,
-                FIELD
-                    && self
-                        .session
-                        .db
-                        .get_type_index()
-                        .get_type_decl(source_id)
-                        .is_some_and(|decl| decl.is_class()),
-            ),
-            LuaType::Generic(source_generic) => (
-                true,
-                FIELD
-                    && self
-                        .session
-                        .db
-                        .get_type_index()
-                        .get_type_decl(source_generic.get_base_type_id_ref())
-                        .is_some_and(|decl| decl.is_class()),
-            ),
-            LuaType::Tuple(_) | LuaType::TableGeneric(_) | LuaType::Intersection(_) => {
-                (false, FIELD)
-            }
-            LuaType::Signature(_)
-            | LuaType::Instance(_)
-            | LuaType::Call(_)
-            | LuaType::Conditional(_)
-            | LuaType::Mapped(_)
-            | LuaType::MultiLineUnion(_)
-            | LuaType::TypeGuard(_)
-            | LuaType::ModuleRef(_) => (true, false),
-            LuaType::TplRef(tpl) => (tpl.get_constraint().is_some(), false),
-            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => {
-                // 游戏开发可能会为巨型配置表创建 ID 集合, 在此提前匹配
-                let target_origin = match target {
-                    LuaType::Union(_) => Some(target),
-                    LuaType::Ref(target_id) => self
-                        .session
-                        .db
-                        .get_type_index()
-                        .get_type_decl(target_id)
-                        .and_then(|target_decl| target_decl.get_alias_ref()),
-                    _ => None,
-                };
-                let exact_member = match target_origin {
-                    Some(LuaType::MultiLineUnion(union)) => union
-                        .get_unions()
-                        .iter()
-                        .any(|(candidate, _)| fast_eq_check(source, candidate)),
-                    Some(LuaType::Union(union)) => match union.as_ref() {
-                        LuaUnionType::Basic(_) => false,
-                        LuaUnionType::Nullable(candidate) => fast_eq_check(source, candidate),
-                        LuaUnionType::Multi(candidates) => candidates
-                            .iter()
-                            .any(|candidate| fast_eq_check(source, candidate)),
-                    },
-                    _ => false,
-                };
-                if exact_member {
-                    return Ok(());
-                }
-                (false, false)
-            }
-            _ => (false, false),
-        };
-
-        // 一些高频结构需要在此提前处理以提高性能
-        if allow_structured_fast_path {
-            if let LuaType::Object(target_object) = target {
-                return self.run_fast_path(|relater| {
-                    relate_to_object_target(
-                        relater,
-                        source,
-                        target,
-                        target_object,
-                        intersection_state,
-                    )
-                });
-            }
-
-            if matches!(
-                source,
-                LuaType::TableConst(_)
-                    | LuaType::Object(_)
-                    | LuaType::Tuple(_)
-                    | LuaType::Array(_)
-                    | LuaType::TableGeneric(_)
-                    | LuaType::Intersection(_)
-            ) {
-                let target_decl = match target {
-                    LuaType::Ref(target_id) | LuaType::Def(target_id) => {
-                        self.session.db.get_type_index().get_type_decl(target_id)
-                    }
-                    LuaType::Generic(target_generic) => self
-                        .session
-                        .db
-                        .get_type_index()
-                        .get_type_decl(target_generic.get_base_type_id_ref()),
-                    _ => None,
-                };
-                if target_decl.is_some_and(|decl| !decl.is_alias() && !decl.is_enum()) {
-                    return self.run_fast_path(|relater| {
-                        relate_to_declared_target_members(
-                            relater,
-                            source,
-                            target,
-                            intersection_state,
-                        )
-                    });
-                }
-            }
-        }
-
-        if let Some(result) = relate_simple::<true>(self, source, target, intersection_state) {
+        // 高频结构组的直达通道
+        if let Some(result) = self.try_structural_fast_dial(source, target, intersection_state) {
             return result;
         }
 
+        // 游戏开发可能会为巨型配置表创建 ID 集合, 常量对枚举集合可直接快速命中
+        if matches!(
+            source,
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+        ) && matches!(
+            target,
+            LuaType::Union(_) | LuaType::MultiLineUnion(_) | LuaType::Ref(_) | LuaType::Def(_)
+        ) && accept_const_enum_member(self.session.db, source, target)
+        {
+            return Ok(());
+        }
+
+        // 简单类型关系
+        if let Some(result) = relate_simple(self, source, target) {
+            return result;
+        }
+
+        // 归一化和类型分解也会重入关系检查, 必须先建立递归防护.
         if self.session.recursion_depth >= 100 {
             return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
         }
 
-        let target_requires_scope = match target {
-            LuaType::Ref(_)
-            | LuaType::Def(_)
-            | LuaType::Generic(_)
-            | LuaType::Signature(_)
-            | LuaType::Instance(_)
-            | LuaType::Call(_)
-            | LuaType::Conditional(_)
-            | LuaType::Mapped(_)
-            | LuaType::MultiLineUnion(_)
-            | LuaType::TypeGuard(_)
-            | LuaType::ModuleRef(_) => true,
-            LuaType::TplRef(tpl) => tpl.get_constraint().is_some(),
-            _ => false,
-        };
-
-        if source_requires_scope || target_requires_scope {
-            // 重复进入活动关系链中的同一关系时, 当前递归边直接判定为成功
-            let mut active = self.active_relation;
-            while let Some(relation) = active {
-                if relation.intersection_state == intersection_state
-                    && relation_type_eq(relation.source, source)
-                    && relation_type_eq(relation.target, target)
-                {
-                    return Ok(());
-                }
-                active = relation.parent;
+        if is_scoped_type(source) || is_scoped_type(target) {
+            if self.is_active_relation(source, target, intersection_state) {
+                return Ok(());
             }
             self.consume_relation_budget()?;
             self.with_relation_scope(source, target, intersection_state, |relater| {
-                relater.relate_with::<FIELD>(source, target, intersection_state, true)
+                relater.relate_in_scope(source, target, intersection_state)
             })
         } else {
-            self.run_fast_path(|relater| {
-                relater.relate_with::<FIELD>(source, target, intersection_state, true)
-            })
+            self.session.recursion_depth += 1;
+            let result = self.relate_in_scope(source, target, intersection_state);
+            self.session.recursion_depth -= 1;
+            result
         }
     }
 
-    fn relate_guarded<const FIELD: bool>(
+    fn relate_in_scope(
         &mut self,
         source: &LuaType,
         target: &LuaType,
         intersection_state: IntersectionState,
     ) -> RelationResult {
+        // 归一化必须先于 union 分解, 否则别名展开会在每个 union 成员探测中重复执行.
         if let Some(normalized) = normalize_type(self.session.db, source)
             && normalized != *source
         {
@@ -399,7 +227,8 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         if let Some(normalized) = normalize_type(self.session.db, target)
             && normalized != *target
         {
-            if matches!(target, LuaType::Ref(_)) && *source == normalized {
+            // 别名展开后可能与 source 结构相同
+            if *source == normalized {
                 return Ok(());
             }
             return self.relate(source, &normalized, intersection_state);
@@ -409,94 +238,118 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
             return Ok(());
         }
 
-        // 复合类型需要提前拆分
-        if let Some(result) = relate_union(self, source, target, intersection_state) {
-            return result;
-        }
-        if let Some(result) = relate_intersection(self, source, target, intersection_state) {
-            return result;
-        }
-
-        // 同 id 的 constraint 是循环约束, 不能降级成预注册的无约束占位符.
-        if let LuaType::TplRef(target_tpl) = target
-            && let Some(constraint) = target_tpl.get_constraint()
-        {
-            if is_circular_tpl_constraint(target_tpl) {
-                return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
+        // 可分解类型: union/intersection 优先拆解
+        if matches!(
+            source,
+            LuaType::Union(_) | LuaType::MultiLineUnion(_) | LuaType::Intersection(_)
+        ) || matches!(
+            target,
+            LuaType::Union(_) | LuaType::MultiLineUnion(_) | LuaType::Intersection(_)
+        ) {
+            if let Some(result) = relate_union(self, source, target, intersection_state) {
+                return result;
             }
-            return self.relate(source, constraint, intersection_state);
-        }
-        if let LuaType::TplRef(source_tpl) = source
-            && let Some(constraint) = source_tpl.get_constraint()
-        {
-            if is_circular_tpl_constraint(source_tpl) {
-                return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
+            if let Some(result) = relate_intersection(self, source, target, intersection_state) {
+                return result;
             }
-            return self.relate(constraint, target, intersection_state);
         }
 
-        if matches!(source, LuaType::Unknown) {
-            return Ok(());
+        // 同 id 的 constraint 是循环约束, 规范化无法解开, 判为不确定.
+        if matches!(source, LuaType::TplRef(_)) || matches!(target, LuaType::TplRef(_)) {
+            return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
         }
 
+        // 终态
         if matches!(source, LuaType::Never) {
-            if matches!(target, LuaType::Never) {
-                return Ok(());
-            }
-            return self.fail(|db| not_assignable_message(db, source, target));
+            return if matches!(target, LuaType::Never) {
+                Ok(())
+            } else {
+                self.fail(|db| not_assignable_message(db, source, target))
+            };
         }
         if matches!(target, LuaType::Never) {
             return self.fail(|db| not_assignable_message(db, source, target));
         }
 
-        // 声明类型和带元表的常量表可能同时具有结构约束和调用能力, 必须先保留结构关系的确定结论.
-        let source_relation = match source {
-            LuaType::Function | LuaType::DocFunction(_) | LuaType::Signature(_) => {
-                relate_callable(self, source, target, intersection_state)
-            }
-            LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-                relate_structured(self, source, target, intersection_state)
-                    .or_else(|| relate_callable(self, source, target, intersection_state))
-            }
-            LuaType::TableConst(table)
-                if self.session.db.get_metatable_index().get(table).is_some() =>
-            {
-                relate_structured(self, source, target, intersection_state)
-                    .or_else(|| relate_callable(self, source, target, intersection_state))
-            }
-            _ => relate_structured(self, source, target, intersection_state),
-        };
-        if let Some(result) = source_relation
-            .or_else(|| relate_simple::<false>(self, source, target, intersection_state))
-        {
-            return result;
+        match dispatch_structured(self, source, target, intersection_state) {
+            Some(result) => result,
+            None => self.fail(|db| not_assignable_message(db, source, target)),
         }
-
-        self.fail(|db| not_assignable_message(db, source, target))
     }
 
-    /// 快速路径, 用在确定无复杂行为的类型检查
-    fn run_fast_path(
+    /// 高频结构的直达通道
+    fn try_structural_fast_dial(
         &mut self,
-        body: impl FnOnce(&mut Relater<'_, '_, 'db>) -> RelationResult,
-    ) -> RelationResult {
+        source: &LuaType,
+        target: &LuaType,
+        intersection_state: IntersectionState,
+    ) -> Option<RelationResult> {
+        enum DialBody<'a> {
+            Array(&'a LuaArrayType, &'a LuaArrayType),
+            ObjectToObject(&'a LuaObjectType, &'a LuaObjectType),
+            Members,
+        }
+        let body = match (source, target) {
+            (LuaType::Array(source_array), LuaType::Array(target_array)) => {
+                DialBody::Array(source_array, target_array)
+            }
+            (LuaType::Object(source_object), LuaType::Object(target_object)) => {
+                DialBody::ObjectToObject(source_object, target_object)
+            }
+            (LuaType::TableConst(_), LuaType::Object(_)) => DialBody::Members,
+            (
+                LuaType::TableConst(_) | LuaType::Object(_),
+                LuaType::Ref(target_id) | LuaType::Def(target_id),
+            ) => {
+                // 非别名非枚举的类目标直接比较成员.
+                let target_decl = self.session.db.get_type_index().get_type_decl(target_id)?;
+                if target_decl.is_alias() || target_decl.is_enum() {
+                    return None;
+                }
+                DialBody::Members
+            }
+            _ => return None,
+        };
+
         if self.session.recursion_depth >= 100 {
-            return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
+            return Some(Err(RelationFailure::Indeterminate(OverflowKind::Recursion)));
         }
         self.session.recursion_depth += 1;
-        let result = body(self);
+        let result = match body {
+            DialBody::Array(source_array, target_array) => {
+                relate_array_to_array(self, source_array, target_array, intersection_state)
+            }
+            DialBody::ObjectToObject(source_object, target_object) => relate_object_to_object(
+                self,
+                source,
+                target,
+                source_object,
+                target_object,
+                intersection_state,
+            ),
+            DialBody::Members => relate_members(self, source, target, intersection_state),
+        };
         self.session.recursion_depth -= 1;
-        result
+        Some(result)
     }
 
-    // 字段成员需要走快速类型检查通道以提高性能
-    pub(super) fn relate_field_types(
-        &mut self,
-        source_member: &LuaType,
-        target_member: &LuaType,
+    fn is_active_relation(
+        &self,
+        source: &LuaType,
+        target: &LuaType,
         intersection_state: IntersectionState,
-    ) -> RelationResult {
-        self.relate_with::<true>(source_member, target_member, intersection_state, false)
+    ) -> bool {
+        let mut active = self.active_relation;
+        while let Some(relation) = active {
+            if relation.intersection_state == intersection_state
+                && relation_type_eq(relation.source, source)
+                && relation_type_eq(relation.target, target)
+            {
+                return true;
+            }
+            active = relation.parent;
+        }
+        false
     }
 
     /// 创建完整的活动关系作用域, 用于处理复杂类型.
@@ -582,10 +435,47 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
     }
 }
 
-// 这里应该只写确定是高频或必须的类型匹配检查, 不要使用完整的 fast_eq_check.
-fn relate_semantic_accept(source: &LuaType, target: &LuaType) -> bool {
-    matches!(source, LuaType::Any | LuaType::SelfInfer)
-        || matches!(target, LuaType::Any | LuaType::Unknown | LuaType::SelfInfer)
-        || matches!(source, LuaType::TplRef(tpl) if tpl.get_constraint().is_none())
-        || matches!(target, LuaType::TplRef(tpl) if tpl.get_constraint().is_none())
+/// 常量对巨型枚举集合的快速命中.
+fn accept_const_enum_member(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
+    let target_origin = match target {
+        LuaType::Union(_) => Some(target),
+        LuaType::Ref(target_id) => db
+            .get_type_index()
+            .get_type_decl(target_id)
+            .and_then(|target_decl| target_decl.get_alias_ref()),
+        _ => None,
+    };
+    match target_origin {
+        Some(LuaType::MultiLineUnion(union)) => union
+            .get_unions()
+            .iter()
+            .any(|(candidate, _)| fast_eq_check(source, candidate)),
+        Some(LuaType::Union(union)) => match union.as_ref() {
+            LuaUnionType::Basic(_) => false,
+            LuaUnionType::Nullable(candidate) => fast_eq_check(source, candidate),
+            LuaUnionType::Multi(candidates) => candidates
+                .iter()
+                .any(|candidate| fast_eq_check(source, candidate)),
+        },
+        _ => false,
+    }
+}
+
+/// 环检测仅在涉及声明/实例/签名/约束等可能成环的类型时启用.
+fn is_scoped_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(_)
+        | LuaType::Def(_)
+        | LuaType::Generic(_)
+        | LuaType::Signature(_)
+        | LuaType::Instance(_)
+        | LuaType::Call(_)
+        | LuaType::Conditional(_)
+        | LuaType::Mapped(_)
+        | LuaType::MultiLineUnion(_)
+        | LuaType::TypeGuard(_)
+        | LuaType::ModuleRef(_) => true,
+        LuaType::TplRef(tpl) => tpl.get_constraint().is_some(),
+        _ => false,
+    }
 }
