@@ -155,7 +155,7 @@ impl LuaTypeNode for LuaUnionType {
             LuaUnionType::Basic(_) => {}
             LuaUnionType::Nullable(ty) => stack.push(ty),
             LuaUnionType::Multi(types) => {
-                for ty in types.iter().rev() {
+                for ty in types.get_types().iter().rev() {
                     stack.push(ty);
                 }
             }

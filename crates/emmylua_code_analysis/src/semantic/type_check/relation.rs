@@ -358,6 +358,7 @@ fn accept_const_enum_member(db: &DbIndex, source: &LuaType, target: &LuaType) ->
             LuaUnionType::Basic(_) => false,
             LuaUnionType::Nullable(candidate) => fast_eq_check(source, candidate),
             LuaUnionType::Multi(candidates) => candidates
+                .get_types()
                 .iter()
                 .any(|candidate| fast_eq_check(source, candidate)),
         },

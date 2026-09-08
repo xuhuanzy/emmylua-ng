@@ -196,7 +196,10 @@ fn is_optional_inner(db: &DbIndex, typ: &LuaType, depth: usize) -> bool {
         LuaType::Union(union) => match union.as_ref() {
             LuaUnionType::Basic(basic) => basic.contains(BasicTypeKind::Nil),
             LuaUnionType::Nullable(_) => true,
-            LuaUnionType::Multi(types) => types.iter().any(|t| is_optional_inner(db, t, depth + 1)),
+            LuaUnionType::Multi(types) => types
+                .get_types()
+                .iter()
+                .any(|t| is_optional_inner(db, t, depth + 1)),
         },
         LuaType::MultiLineUnion(union) => union
             .get_unions()

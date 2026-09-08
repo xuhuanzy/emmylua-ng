@@ -440,7 +440,7 @@ mod test {
 
     use crate::{
         LuaIndex, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMultiLineUnion, LuaType,
-        LuaTypeDeclId, LuaUnionType, VirtualWorkspace, find_members_with_key,
+        LuaTypeDeclId, LuaUnionMembers, LuaUnionType, VirtualWorkspace, find_members_with_key,
         semantic::{
             cache::SemanticLocalCache,
             type_check::{AssignabilityResult, check_assignable, is_assignable},
@@ -558,10 +558,15 @@ mod test {
             LuaMultiLineUnion::new(vec![(left.clone(), None), (right, None)]).into(),
         ));
         types.push(LuaType::Union(
-            LuaUnionType::Multi(vec![left, union.clone()]).into(),
+            LuaUnionType::Multi(LuaUnionMembers::new(vec![left, union.clone()])).into(),
         ));
         types.push(LuaType::Union(
-            LuaUnionType::Multi(vec![LuaType::Never, union, LuaType::Never]).into(),
+            LuaUnionType::Multi(LuaUnionMembers::new(vec![
+                LuaType::Never,
+                union,
+                LuaType::Never,
+            ]))
+            .into(),
         ));
         let override_type = ws.ty("UnionCacheOverride");
         let expected = ws.ty("string | number");

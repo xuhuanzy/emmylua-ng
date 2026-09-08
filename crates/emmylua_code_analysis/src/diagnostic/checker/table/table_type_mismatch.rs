@@ -296,6 +296,7 @@ fn get_table_field_target<'a>(
             LuaUnionType::Basic(_) => None,
             LuaUnionType::Multi(types) => {
                 let non_nil: Vec<_> = types
+                    .get_types()
                     .iter()
                     .map(|t| get_real_type(db, t).unwrap_or(t))
                     .filter(|t| !t.is_nil())
@@ -371,7 +372,7 @@ fn is_table_field_target(db: &DbIndex, typ: &LuaType) -> bool {
             LuaUnionType::Nullable(inner) => is_table_field_target(db, inner),
             LuaUnionType::Basic(_) => false,
             LuaUnionType::Multi(types) => {
-                let non_nil: Vec<_> = types.iter().filter(|t| !t.is_nil()).collect();
+                let non_nil: Vec<_> = types.get_types().iter().filter(|t| !t.is_nil()).collect();
                 !non_nil.is_empty() && non_nil.iter().all(|t| is_table_field_target(db, t))
             }
         },

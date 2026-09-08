@@ -49,7 +49,10 @@ fn can_empty_table_satisfy_type(db: &DbIndex, ty: &LuaType) -> bool {
                 }
                 LuaUnionType::Multi(types) => {
                     // At least one type in union must be satisfiable
-                    types.iter().any(|t| can_empty_table_satisfy_type(db, t))
+                    types
+                        .get_types()
+                        .iter()
+                        .any(|t| can_empty_table_satisfy_type(db, t))
                 }
             }
         }

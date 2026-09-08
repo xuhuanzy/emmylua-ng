@@ -82,7 +82,9 @@ mod tests {
 
     #[test]
     fn test_union_iterator() {
-        use crate::{BasicTypeKind, BasicTypeUnion, LuaMultiLineUnion, LuaUnionType};
+        use crate::{
+            BasicTypeKind, BasicTypeUnion, LuaMultiLineUnion, LuaUnionMembers, LuaUnionType,
+        };
 
         // 基础类型联合
         let mut basic = BasicTypeUnion::new();
@@ -105,8 +107,11 @@ mod tests {
         assert_eq!(union_nullable.iter().len(), 2);
 
         // 多成员联合
-        let union_multi =
-            LuaUnionType::Multi(vec![LuaType::Integer, LuaType::String, LuaType::Boolean]);
+        let union_multi = LuaUnionType::Multi(LuaUnionMembers::new(vec![
+            LuaType::Integer,
+            LuaType::String,
+            LuaType::Boolean,
+        ]));
         let mut iter = union_multi.iter();
         assert_eq!(
             iter.next(),

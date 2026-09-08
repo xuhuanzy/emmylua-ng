@@ -338,6 +338,6 @@ fn union_contains_multi_return(union: &LuaUnionType) -> bool {
     match union {
         LuaUnionType::Basic(_) => false,
         LuaUnionType::Nullable(ty) => ty.contain_multi_return(),
-        LuaUnionType::Multi(types) => types.iter().any(LuaType::contain_multi_return),
+        LuaUnionType::Multi(types) => types.get_types().iter().any(LuaType::contain_multi_return),
     }
 }
