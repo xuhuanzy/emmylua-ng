@@ -91,7 +91,7 @@ fn infer_table_tuple_or_array(
                 let field = fields.get(i).ok_or(InferFailReason::None)?;
                 let value_expr = field.get_value_expr().ok_or(InferFailReason::None)?;
                 let typ = infer_expr(db, cache, value_expr)?;
-                if !is_assignable(db, &typ, &non_nil_base) {
+                if !is_assignable(db, &typ, &non_nil_base, None) {
                     all_can_accept_base = false;
                     break;
                 }

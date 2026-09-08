@@ -1,26 +1,22 @@
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 use crate::{
-    DbIndex, LuaArrayType, LuaObjectType, LuaType, LuaUnionType,
-    semantic::type_check::{
-        error_chain::{
-            ChainMessage, ErrorChain, OverflowKind, not_assignable_message, push_message,
-        },
-        fast_eq_check, normalize_type,
-    },
+    DbIndex, LuaType, LuaUnionType,
+    semantic::cache::{SemanticLocalCache, TypeCacheEntry},
 };
 
 use super::{
-    accept_reflexive_or_semantic,
+    error_chain::{ChainMessage, ErrorChain, OverflowKind, not_assignable_message, push_message},
+    fast_eq_check,
     intersection::relate_intersection,
-    simple::relate_simple,
-    structured::{
-        dispatch_structured, relate_array_to_array, relate_members, relate_object_to_object,
-    },
+    normalize_type,
+    simple::is_simple_assignable,
+    structured::dispatch_structured,
     union::relate_union,
 };
 
 pub(crate) type RelationResult = Result<(), RelationFailure>;
+type RelationKey = (LuaType, LuaType, IntersectionState);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelationFailure {
@@ -28,10 +24,10 @@ pub(crate) enum RelationFailure {
     Indeterminate(OverflowKind),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RelationOutcome {
-    Related,
-    Unrelated,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignabilityResult {
+    Assignable,
+    NotAssignable(Option<ErrorChain>),
     Indeterminate(OverflowKind),
 }
 
@@ -49,7 +45,7 @@ impl IntersectionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvidenceMode {
+pub(crate) enum EvidenceMode {
     Silent,
     Explain,
 }
@@ -64,149 +60,144 @@ fn relation_type_eq(source: &LuaType, target: &LuaType) -> bool {
     source == target
 }
 
-struct ActiveRelation<'active> {
-    source: &'active LuaType,
-    target: &'active LuaType,
-    intersection_state: IntersectionState,
-    parent: Option<&'active ActiveRelation<'active>>,
-}
-
-pub(crate) struct RelationSession<'db> {
+pub(crate) struct Relater<'db> {
     db: &'db DbIndex,
+    cache: &'db mut SemanticLocalCache,
     evidence: EvidenceMode,
     relation_budget: u32,
     recursion_depth: u16,
-    error_chain: Option<ErrorChain>,
+    pub(crate) error_chain: Option<ErrorChain>,
+    assumption_count: usize,
+    active_relations: Vec<RelationKey>,
 }
 
-pub(crate) struct Relater<'session, 'active, 'db> {
-    session: &'session mut RelationSession<'db>,
-    active_relation: Option<&'active ActiveRelation<'active>>,
-}
-
-impl<'db> RelationSession<'db> {
-    fn new(db: &'db DbIndex, evidence: EvidenceMode) -> Self {
+impl<'db> Relater<'db> {
+    pub(crate) fn new(
+        db: &'db DbIndex,
+        cache: &'db mut SemanticLocalCache,
+        evidence: EvidenceMode,
+    ) -> Self {
         Self {
             db,
+            cache,
             evidence,
             relation_budget: 20_000,
             recursion_depth: 0,
             error_chain: None,
+            assumption_count: 0,
+            active_relations: Vec::new(),
         }
     }
 
-    fn relate(
-        &mut self,
-        source: &LuaType,
-        target: &LuaType,
-        intersection_state: IntersectionState,
-    ) -> RelationResult {
-        let mut relater = Relater {
-            session: self,
-            active_relation: None,
-        };
-        relater.relate(source, target, intersection_state)
-    }
-
-    pub(crate) fn probe(db: &'db DbIndex, source: &LuaType, target: &LuaType) -> RelationOutcome {
-        let mut session = Self::new(db, EvidenceMode::Silent);
-        match session.relate(source, target, IntersectionState::NONE) {
-            Ok(()) => RelationOutcome::Related,
-            Err(RelationFailure::Unrelated) => RelationOutcome::Unrelated,
-            Err(RelationFailure::Indeterminate(kind)) => RelationOutcome::Indeterminate(kind),
-        }
-    }
-
-    pub(crate) fn explain(
-        db: &'db DbIndex,
-        source: &LuaType,
-        target: &LuaType,
-    ) -> super::AssignabilityResult {
-        let mut session = Self::new(db, EvidenceMode::Explain);
-        match session.relate(source, target, IntersectionState::NONE) {
-            Ok(()) => super::AssignabilityResult::Assignable,
-            Err(RelationFailure::Unrelated) => {
-                super::AssignabilityResult::NotAssignable(session.error_chain)
-            }
-            Err(RelationFailure::Indeterminate(kind)) => {
-                super::AssignabilityResult::Indeterminate(kind)
-            }
-        }
-    }
-}
-
-impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
     pub(super) fn db(&self) -> &'db DbIndex {
-        self.session.db
+        self.db
+    }
+
+    pub(super) fn type_entry(&mut self, typ: &LuaType) -> Rc<TypeCacheEntry> {
+        self.cache.type_entry(typ)
     }
 
     pub(super) fn is_explain(&self) -> bool {
-        matches!(self.session.evidence, EvidenceMode::Explain)
+        matches!(self.evidence, EvidenceMode::Explain)
     }
 
     pub(super) fn remaining_relation_budget(&self) -> usize {
-        self.session.relation_budget as usize
+        self.relation_budget as usize
     }
 
     pub(super) fn consume_relation_budget(&mut self) -> RelationResult {
-        if self.session.relation_budget == 0 {
+        if self.relation_budget == 0 {
             return Err(RelationFailure::Indeterminate(OverflowKind::Budget));
         }
-        self.session.relation_budget -= 1;
+        self.relation_budget -= 1;
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn relate(
         &mut self,
         source: &LuaType,
         target: &LuaType,
         intersection_state: IntersectionState,
     ) -> RelationResult {
-        if accept_reflexive_or_semantic(source, target) {
-            return Ok(());
+        if let Some(related) = is_simple_assignable(source, target) {
+            return if related {
+                Ok(())
+            } else {
+                self.fail(|db| not_assignable_message(db, source, target))
+            };
         }
+        self.relate_complex(source, target, intersection_state)
+    }
 
-        // 高频结构组的直达通道
-        if let Some(result) = self.try_structural_fast_dial(source, target, intersection_state) {
-            return result;
-        }
-
-        // 游戏开发可能会为巨型配置表创建 ID 集合, 常量对枚举集合可直接快速命中
+    pub(crate) fn relate_complex(
+        &mut self,
+        source: &LuaType,
+        target: &LuaType,
+        intersection_state: IntersectionState,
+    ) -> RelationResult {
         if matches!(
             source,
             LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
-        ) && matches!(
-            target,
-            LuaType::Union(_) | LuaType::MultiLineUnion(_) | LuaType::Ref(_) | LuaType::Def(_)
-        ) && accept_const_enum_member(self.session.db, source, target)
+        ) && accept_const_enum_member(self.db, source, target)
         {
             return Ok(());
         }
 
-        // 简单类型关系
-        if let Some(result) = relate_simple(self, source, target) {
-            return result;
+        let key = (source.clone(), target.clone(), intersection_state);
+        if let Some(&related) = self.cache.relations.get(&key) {
+            if related {
+                return Ok(());
+            }
+            // 失败缓存只供探测复用, 诊断仍需重建当前错误链.
+            if !self.is_explain() {
+                return Err(RelationFailure::Unrelated);
+            }
         }
 
-        // 归一化和类型分解也会重入关系检查, 必须先建立递归防护.
-        if self.session.recursion_depth >= 100 {
+        let assumption_count = self.assumption_count;
+        let is_root = self.recursion_depth == 0;
+        let result = self.relate_uncached(source, target, intersection_state);
+        match result {
+            Ok(()) if is_root || assumption_count == self.assumption_count => {
+                self.cache.relations.insert(key, true);
+            }
+            Err(RelationFailure::Unrelated) => {
+                self.cache.relations.insert(key, false);
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn relate_uncached(
+        &mut self,
+        source: &LuaType,
+        target: &LuaType,
+        intersection_state: IntersectionState,
+    ) -> RelationResult {
+        if self.recursion_depth >= 100 {
             return Err(RelationFailure::Indeterminate(OverflowKind::Recursion));
         }
 
-        if is_scoped_type(source) || is_scoped_type(target) {
+        let scoped = is_scoped_type(source) || is_scoped_type(target);
+        if scoped {
             if self.is_active_relation(source, target, intersection_state) {
+                // 依赖闭环假设的子关系成功不能提前写入共享缓存.
+                self.assumption_count += 1;
                 return Ok(());
             }
             self.consume_relation_budget()?;
-            self.with_relation_scope(source, target, intersection_state, |relater| {
-                relater.relate_in_scope(source, target, intersection_state)
-            })
-        } else {
-            self.session.recursion_depth += 1;
-            let result = self.relate_in_scope(source, target, intersection_state);
-            self.session.recursion_depth -= 1;
-            result
+            self.active_relations
+                .push((source.clone(), target.clone(), intersection_state));
         }
+        self.recursion_depth += 1;
+        let result = self.relate_in_scope(source, target, intersection_state);
+        self.recursion_depth -= 1;
+        if scoped {
+            self.active_relations.pop();
+        }
+        result
     }
 
     fn relate_in_scope(
@@ -216,7 +207,7 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         intersection_state: IntersectionState,
     ) -> RelationResult {
         // 归一化必须先于 union 分解, 否则别名展开会在每个 union 成员探测中重复执行.
-        if let Some(normalized) = normalize_type(self.session.db, source)
+        if let Some(normalized) = normalize_type(self.db, source)
             && normalized != *source
         {
             if matches!(source, LuaType::Ref(_)) && normalized == *target {
@@ -224,7 +215,7 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
             }
             return self.relate(&normalized, target, intersection_state);
         }
-        if let Some(normalized) = normalize_type(self.session.db, target)
+        if let Some(normalized) = normalize_type(self.db, target)
             && normalized != *target
         {
             // 别名展开后可能与 source 结构相同
@@ -277,103 +268,20 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         }
     }
 
-    /// 高频结构的直达通道
-    fn try_structural_fast_dial(
-        &mut self,
-        source: &LuaType,
-        target: &LuaType,
-        intersection_state: IntersectionState,
-    ) -> Option<RelationResult> {
-        enum DialBody<'a> {
-            Array(&'a LuaArrayType, &'a LuaArrayType),
-            ObjectToObject(&'a LuaObjectType, &'a LuaObjectType),
-            Members,
-        }
-        let body = match (source, target) {
-            (LuaType::Array(source_array), LuaType::Array(target_array)) => {
-                DialBody::Array(source_array, target_array)
-            }
-            (LuaType::Object(source_object), LuaType::Object(target_object)) => {
-                DialBody::ObjectToObject(source_object, target_object)
-            }
-            (LuaType::TableConst(_), LuaType::Object(_)) => DialBody::Members,
-            (
-                LuaType::TableConst(_) | LuaType::Object(_),
-                LuaType::Ref(target_id) | LuaType::Def(target_id),
-            ) => {
-                // 非别名非枚举的类目标直接比较成员.
-                let target_decl = self.session.db.get_type_index().get_type_decl(target_id)?;
-                if target_decl.is_alias() || target_decl.is_enum() {
-                    return None;
-                }
-                DialBody::Members
-            }
-            _ => return None,
-        };
-
-        if self.session.recursion_depth >= 100 {
-            return Some(Err(RelationFailure::Indeterminate(OverflowKind::Recursion)));
-        }
-        self.session.recursion_depth += 1;
-        let result = match body {
-            DialBody::Array(source_array, target_array) => {
-                relate_array_to_array(self, source_array, target_array, intersection_state)
-            }
-            DialBody::ObjectToObject(source_object, target_object) => relate_object_to_object(
-                self,
-                source,
-                target,
-                source_object,
-                target_object,
-                intersection_state,
-            ),
-            DialBody::Members => relate_members(self, source, target, intersection_state),
-        };
-        self.session.recursion_depth -= 1;
-        Some(result)
-    }
-
     fn is_active_relation(
         &self,
         source: &LuaType,
         target: &LuaType,
         intersection_state: IntersectionState,
     ) -> bool {
-        let mut active = self.active_relation;
-        while let Some(relation) = active {
-            if relation.intersection_state == intersection_state
-                && relation_type_eq(relation.source, source)
-                && relation_type_eq(relation.target, target)
-            {
-                return true;
-            }
-            active = relation.parent;
-        }
-        false
-    }
-
-    /// 创建完整的活动关系作用域, 用于处理复杂类型.
-    fn with_relation_scope(
-        &mut self,
-        source: &LuaType,
-        target: &LuaType,
-        intersection_state: IntersectionState,
-        body: impl FnOnce(&mut Relater<'_, '_, 'db>) -> RelationResult,
-    ) -> RelationResult {
-        self.session.recursion_depth += 1;
-        let active_relation = ActiveRelation {
-            source,
-            target,
-            intersection_state,
-            parent: self.active_relation,
-        };
-        let mut relater = Relater {
-            session: &mut *self.session,
-            active_relation: Some(&active_relation),
-        };
-        let result = body(&mut relater);
-        self.session.recursion_depth -= 1;
-        result
+        self.active_relations
+            .iter()
+            .rev()
+            .any(|(active_source, active_target, state)| {
+                *state == intersection_state
+                    && relation_type_eq(active_source, source)
+                    && relation_type_eq(active_target, target)
+            })
     }
 
     /// 关系探测, 用于选出候选结果
@@ -382,16 +290,12 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         source: &LuaType,
         target: &LuaType,
         intersection_state: IntersectionState,
-    ) -> RelationOutcome {
-        let evidence = self.session.evidence;
-        self.session.evidence = EvidenceMode::Silent;
+    ) -> RelationResult {
+        let evidence = self.evidence;
+        self.evidence = EvidenceMode::Silent;
         let result = self.relate(source, target, intersection_state);
-        self.session.evidence = evidence;
-        match result {
-            Ok(()) => RelationOutcome::Related,
-            Err(RelationFailure::Unrelated) => RelationOutcome::Unrelated,
-            Err(RelationFailure::Indeterminate(kind)) => RelationOutcome::Indeterminate(kind),
-        }
+        self.evidence = evidence;
+        result
     }
 
     /// 在叶子失败时调用, 用于构建具体的错误
@@ -400,7 +304,7 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         message: impl FnOnce(&DbIndex) -> ChainMessage,
     ) -> RelationResult {
         if self.is_explain() {
-            let message = message(self.session.db);
+            let message = message(self.db);
             self.push_error_message(message);
         }
         Err(RelationFailure::Unrelated)
@@ -415,23 +319,23 @@ impl<'session, 'active, 'db> Relater<'session, 'active, 'db> {
         if let Err(RelationFailure::Unrelated) = &result
             && self.is_explain()
         {
-            let message = message(self.session.db);
+            let message = message(self.db);
             self.push_error_message(message);
         }
         result
     }
 
     fn push_error_message(&mut self, message: ChainMessage) {
-        let head = self.session.error_chain.take();
-        self.session.error_chain = Some(push_message(head, message));
+        let head = self.error_chain.take();
+        self.error_chain = Some(push_message(head, message));
     }
 
     pub(super) fn error_chain_snapshot(&self) -> Option<ErrorChain> {
-        self.session.error_chain.clone()
+        self.error_chain.clone()
     }
 
     pub(super) fn restore_error_chain(&mut self, snapshot: Option<ErrorChain>) {
-        self.session.error_chain = snapshot;
+        self.error_chain = snapshot;
     }
 }
 
@@ -477,5 +381,178 @@ fn is_scoped_type(typ: &LuaType) -> bool {
         | LuaType::ModuleRef(_) => true,
         LuaType::TplRef(tpl) => tpl.get_constraint().is_some(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{VirtualWorkspace, semantic::cache::SemanticLocalCache};
+
+    use super::{
+        AssignabilityResult, ChainMessage, EvidenceMode, IntersectionState, OverflowKind, Relater,
+        RelationFailure,
+    };
+    use crate::semantic::type_check::{check_assignable, probe_assignable};
+
+    // 根类型关系检查失败时, 不会缓存因子类型递归闭环假设而得出的推测性成功.
+    #[test]
+    fn failed_root_does_not_cache_success_from_recursive_assumptions() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CacheRootSource
+            ---@field child CacheChildSource
+            ---@field value string
+            ---@class CacheRootTarget
+            ---@field child CacheChildTarget
+            ---@field value number
+            ---@class CacheChildSource
+            ---@field back CacheRootSource
+            ---@class CacheChildTarget
+            ---@field back CacheRootTarget
+        "#,
+        );
+        let source = ws.ty("CacheRootSource");
+        let target = ws.ty("CacheRootTarget");
+        let child_source = ws.ty("CacheChildSource");
+        let child_target = ws.ty("CacheChildTarget");
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = SemanticLocalCache::default();
+        let mut relater = Relater::new(db, &mut cache, EvidenceMode::Silent);
+        assert_eq!(
+            relater.relate(&source, &target, IntersectionState::NONE),
+            Err(RelationFailure::Unrelated)
+        );
+        assert!(relater.assumption_count > 0);
+        assert_eq!(relater.recursion_depth, 0);
+        assert!(relater.active_relations.is_empty());
+        let child_key = (
+            child_source.clone(),
+            child_target.clone(),
+            IntersectionState::NONE,
+        );
+        assert!(!cache.relations.contains_key(&child_key));
+        assert_eq!(
+            probe_assignable(db, &child_source, &child_target, Some(&mut cache)),
+            Err(RelationFailure::Unrelated)
+        );
+        assert_eq!(cache.relations.get(&child_key), Some(&false));
+    }
+
+    // 根级递归类型检查成功后会被正确缓存, 后续复用无需消耗关系预算.
+    #[test]
+    fn successful_recursive_root_can_be_reused_without_budget() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CacheRecursiveSource
+            ---@field next CacheRecursiveSource
+            ---@class CacheRecursiveTarget
+            ---@field next CacheRecursiveTarget
+        "#,
+        );
+        let source = ws.ty("CacheRecursiveSource");
+        let target = ws.ty("CacheRecursiveTarget");
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = SemanticLocalCache::default();
+        let mut relater = Relater::new(db, &mut cache, EvidenceMode::Silent);
+        assert_eq!(
+            relater.relate(&source, &target, IntersectionState::NONE),
+            Ok(())
+        );
+        assert!(relater.assumption_count > 0);
+        assert_eq!(relater.recursion_depth, 0);
+        assert!(relater.active_relations.is_empty());
+        relater.relation_budget = 0;
+        assert_eq!(
+            relater.relate(&source, &target, IntersectionState::NONE),
+            Ok(())
+        );
+    }
+
+    // 预算超限或递归过深导致的不确定结果不会留下缓存, 且能正确清理活跃作用域.
+    #[test]
+    fn indeterminate_relations_leave_no_cache_or_active_scope() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CacheLimitedSource
+            ---@field next CacheLimitedSource
+            ---@class CacheLimitedTarget
+            ---@field next CacheLimitedTarget
+        "#,
+        );
+        let source = ws.ty("CacheLimitedSource");
+        let target = ws.ty("CacheLimitedTarget");
+        let db = ws.analysis.compilation.get_db();
+        for kind in [OverflowKind::Budget, OverflowKind::Recursion] {
+            let mut cache = SemanticLocalCache::default();
+            let mut relater = Relater::new(db, &mut cache, EvidenceMode::Silent);
+            let initial_depth = match kind {
+                OverflowKind::Budget => {
+                    relater.relation_budget = 1;
+                    0
+                }
+                OverflowKind::Recursion => 99,
+            };
+            relater.recursion_depth = initial_depth;
+            assert_eq!(
+                relater.relate(&source, &target, IntersectionState::NONE),
+                Err(RelationFailure::Indeterminate(kind))
+            );
+            assert_eq!(relater.recursion_depth, initial_depth);
+            assert!(relater.active_relations.is_empty());
+            assert!(relater.cache.relations.is_empty());
+            relater.recursion_depth = 0;
+            relater.relation_budget = 20_000;
+            assert_eq!(
+                relater.relate(&source, &target, IntersectionState::NONE),
+                Ok(())
+            );
+        }
+    }
+
+    // 探测失败结果已缓存时, 诊断模式仍能正确重建字段不匹配与缺失成员的错误链.
+    #[test]
+    fn failed_probe_rebuilds_the_same_field_and_missing_member_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let cases = [
+            (
+                ws.ty("{ branch: { value: string } }"),
+                ws.ty("{ branch: { value: number } }"),
+            ),
+            (
+                ws.ty("{ id: string }"),
+                ws.ty("{ id: string, name: string, count: number }"),
+            ),
+        ];
+        let db = ws.analysis.compilation.get_db();
+        for (index, (source, target)) in cases.into_iter().enumerate() {
+            let expected = check_assignable(db, &source, &target, None);
+            let AssignabilityResult::NotAssignable(Some(chain)) = &expected else {
+                panic!("expected a diagnostic for incompatible members");
+            };
+            if index == 0 {
+                assert_eq!(
+                    chain.message(),
+                    &ChainMessage::Field {
+                        name: "branch.value".into()
+                    }
+                );
+            } else {
+                assert!(matches!(chain.message(), ChainMessage::MissingMembers(_)));
+            }
+            let mut cache = SemanticLocalCache::default();
+            assert_eq!(
+                probe_assignable(db, &source, &target, Some(&mut cache)),
+                Err(RelationFailure::Unrelated)
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    check_assignable(db, &source, &target, Some(&mut cache)),
+                    expected
+                );
+            }
+        }
     }
 }

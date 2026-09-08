@@ -1,6 +1,5 @@
 use crate::{
     LuaArrayLen, LuaArrayType, LuaMemberKey, LuaObjectType, LuaTupleType, LuaType, LuaUnionType,
-    find_members_with_key,
     semantic::type_check::error_chain::{ChainMessage, index_message, not_assignable_message},
 };
 
@@ -8,7 +7,10 @@ use super::super::{
     is_optional,
     relation::{IntersectionState, Relater, RelationResult},
 };
-use super::{declared::visit_declared_members, index::relate_index_member};
+use super::{
+    index::relate_index_member,
+    member::{find_source_member_type, visit_members},
+};
 
 #[inline(always)]
 pub(in crate::semantic::type_check) fn relate_array_to_array(
@@ -118,14 +120,12 @@ pub(super) fn relate_keyed_source_to_array(
 ) -> RelationResult {
     let target_base = effective_array_base(relater, target_array.get_base());
     relater.consume_relation_budget()?;
-    let source_type = find_members_with_key(
-        relater.db(),
+    let source_type = find_source_member_type(
+        relater,
         source,
-        LuaMemberKey::TypeKey(LuaType::Integer),
-        false,
-    )
-    .and_then(|members| members.into_iter().next())
-    .map(|member| member.typ);
+        &LuaMemberKey::TypeKey(LuaType::Integer),
+        intersection_state,
+    )?;
     let Some(source_type) = source_type else {
         return relater.fail(|db| not_assignable_message(db, source, target));
     };
@@ -192,50 +192,49 @@ pub(super) fn relate_array_to_declared_target(
 ) -> RelationResult {
     // 检查是否有整数索引或索引访问, 如果没有, 则不兼容
     let mut has_integer_or_index = false;
-    let result =
-        visit_declared_members(
-            relater,
-            target,
-            |relater, key, target_member_type| match key {
-                LuaMemberKey::Integer(idx) if *idx > 0 => {
-                    has_integer_or_index = true;
-                    // 已知长度覆盖该索引时成员必然存在, 否则保留数组越界产生的 nil.
-                    let source_member_type = if matches!(
-                        source_array.get_len(),
-                        LuaArrayLen::Max(max_len) if idx <= max_len
-                    ) {
-                        source_array.get_base().clone()
-                    } else {
-                        effective_array_base(relater, source_array.get_base())
-                    };
-                    relater.consume_relation_budget()?;
-                    let result =
-                        relater.relate(&source_member_type, target_member_type, intersection_state);
-                    relater.on_unrelated(result, |_| ChainMessage::ArrayElement)?;
-                    Ok(())
+    let result = visit_members(
+        relater,
+        target,
+        |relater, key, target_member_type| match key {
+            LuaMemberKey::Integer(idx) if *idx > 0 => {
+                has_integer_or_index = true;
+                // 已知长度覆盖该索引时成员必然存在, 否则保留数组越界产生的 nil.
+                let source_member_type = if matches!(
+                    source_array.get_len(),
+                    LuaArrayLen::Max(max_len) if idx <= max_len
+                ) {
+                    source_array.get_base().clone()
+                } else {
+                    effective_array_base(relater, source_array.get_base())
+                };
+                relater.consume_relation_budget()?;
+                let result =
+                    relater.relate(&source_member_type, target_member_type, intersection_state);
+                relater.on_unrelated(result, |_| ChainMessage::ArrayElement)?;
+                Ok(())
+            }
+            LuaMemberKey::TypeKey(target_key_type) => {
+                has_integer_or_index = true;
+                if intersection_state.contains(IntersectionState::TARGET) {
+                    return Ok(());
                 }
-                LuaMemberKey::TypeKey(target_key_type) => {
-                    has_integer_or_index = true;
-                    if intersection_state.contains(IntersectionState::TARGET) {
-                        return Ok(());
-                    }
-                    relate_index_member(
-                        relater,
-                        source,
-                        target,
-                        target_key_type,
-                        target_member_type,
-                        intersection_state,
-                    )
+                relate_index_member(
+                    relater,
+                    source,
+                    target,
+                    target_key_type,
+                    target_member_type,
+                    intersection_state,
+                )
+            }
+            _ => {
+                if !is_optional(relater.db(), target_member_type) {
+                    return relater.fail(|db| not_assignable_message(db, source, target));
                 }
-                _ => {
-                    if !is_optional(relater.db(), target_member_type) {
-                        return relater.fail(|db| not_assignable_message(db, source, target));
-                    }
-                    Ok(())
-                }
-            },
-        );
+                Ok(())
+            }
+        },
+    );
 
     if result.is_ok() && !has_integer_or_index {
         return relater.fail(|db| not_assignable_message(db, source, target));

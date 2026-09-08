@@ -7,12 +7,10 @@ mod object_type;
 mod table_const;
 mod tuple;
 
-pub(in crate::semantic::type_check) use array::relate_array_to_array;
 pub(in crate::semantic::type_check) use member::{
     collect_missing_members, relate_members, relate_target_intersection_index_members,
     unrelated_missing_members,
 };
-pub(in crate::semantic::type_check) use object_type::relate_object_to_object;
 
 use crate::{
     LuaGenericType, LuaType, LuaTypeDecl, LuaTypeDeclId, TypeSubstitutor, VariadicType,
@@ -25,14 +23,14 @@ use super::{
     sub_type::get_base_type_id,
 };
 use array::{
-    relate_array_to_object, relate_array_to_tuple, relate_keyed_source_to_array,
-    relate_table_generic_to_array,
+    relate_array_to_array, relate_array_to_object, relate_array_to_tuple,
+    relate_keyed_source_to_array, relate_table_generic_to_array,
 };
 use declared::relate_to_declared_target;
 use generic::relate_same_family_generic_args;
 use index::relate_to_table_generic;
-use object_type::{relate_object_to_array, relate_object_to_tuple};
-use table_const::{relate_table_const_to_array, relate_table_const_to_tuple};
+use object_type::relate_object_to_array;
+use table_const::relate_table_const_to_array;
 use tuple::{
     relate_keyed_source_to_tuple, relate_tuple_to_array, relate_tuple_to_object,
     relate_tuple_to_tuple,
@@ -106,14 +104,6 @@ pub(in crate::semantic::type_check) fn dispatch_structured(
         }
         LuaType::Object(target_object) => {
             let result = match source {
-                LuaType::Object(source_object) => relate_object_to_object(
-                    relater,
-                    source,
-                    target,
-                    source_object,
-                    target_object,
-                    intersection_state,
-                ),
                 LuaType::Tuple(source_tuple) => relate_tuple_to_object(
                     relater,
                     source,
@@ -148,19 +138,12 @@ pub(in crate::semantic::type_check) fn dispatch_structured(
                 LuaType::Array(source_array) => {
                     relate_array_to_tuple(relater, source_array, target_tuple, intersection_state)
                 }
-                LuaType::TableConst(source_range) => relate_table_const_to_tuple(
-                    relater,
-                    source_range,
-                    target_tuple,
-                    intersection_state,
-                ),
-                LuaType::Object(source_object) => {
-                    relate_object_to_tuple(relater, source_object, target_tuple, intersection_state)
-                }
-                LuaType::Intersection(_) => {
-                    relate_keyed_source_to_tuple(relater, source, target_tuple, intersection_state)
-                }
-                _ if is_declared_source(source) => {
+                LuaType::TableConst(_)
+                | LuaType::Object(_)
+                | LuaType::Intersection(_)
+                | LuaType::Ref(_)
+                | LuaType::Def(_)
+                | LuaType::Generic(_) => {
                     relate_keyed_source_to_tuple(relater, source, target_tuple, intersection_state)
                 }
                 _ => return None,

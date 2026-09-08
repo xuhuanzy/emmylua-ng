@@ -1,14 +1,15 @@
+use std::borrow::Cow;
+
 use crate::{
     DbIndex, LuaIntersectionType, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaType,
-    semantic::member::find_members_with_key,
     semantic::type_check::error_chain::{missing_members_message, property_message},
 };
 
 use super::super::{
     is_optional,
-    relation::{IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult},
+    relation::{IntersectionState, Relater, RelationFailure, RelationResult},
 };
-use super::{declared::visit_declared_members, index::relate_index_member};
+use super::index::relate_index_member;
 
 pub(super) fn visit_member_items<E>(
     db: &DbIndex,
@@ -49,7 +50,12 @@ pub(super) fn visit_members(
             })
         }
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => {
-            visit_declared_members(relater, typ, visitor)
+            let entry = relater.type_entry(typ);
+            let db = relater.db();
+            for (key, member) in entry.members(db, typ) {
+                visitor(relater, key, member.typ(db))?;
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -88,7 +94,8 @@ pub(in crate::semantic::type_check) fn relate_members(
     })
 }
 
-pub(super) fn relate_keyed_member(
+#[inline(always)]
+fn relate_keyed_member(
     relater: &mut Relater,
     source: &LuaType,
     key: &LuaMemberKey,
@@ -111,34 +118,54 @@ pub(super) fn relate_keyed_member(
     relater.on_unrelated(field_result, |_| property_message(key))
 }
 
-pub(super) fn find_source_member_type(
+#[inline(always)]
+pub(super) fn find_source_member_type<'source>(
     relater: &mut Relater,
-    source: &LuaType,
+    source: &'source LuaType,
     key: &LuaMemberKey,
     intersection_state: IntersectionState,
-) -> Result<Option<LuaType>, RelationFailure> {
+) -> Result<Option<Cow<'source, LuaType>>, RelationFailure> {
     let member_type = match source {
-        LuaType::Object(source_object) => source_object.get_member_type(key),
+        LuaType::Object(object) => object
+            .get_field(key)
+            .or_else(|| {
+                let LuaMemberKey::TypeKey(key_type) = key else {
+                    return None;
+                };
+                object
+                    .get_index_access()
+                    .iter()
+                    .find_map(|(index_type, value_type)| {
+                        (index_type == key_type).then_some(value_type)
+                    })
+            })
+            .map(Cow::Borrowed),
         LuaType::TableConst(range) => relater
             .db()
             .get_member_index()
             .get_member_item(&LuaMemberOwner::Element(range.clone()), key)
-            .map(|item| item.resolve_type(relater.db()).unwrap_or(LuaType::Any)),
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) | LuaType::Intersection(_) => {
-            find_members_with_key(relater.db(), source, key.clone(), false)
-                .and_then(|members| members.into_iter().next())
-                .map(|member| member.typ)
+            .map(|item| Cow::Owned(item.resolve_type(relater.db()).unwrap_or(LuaType::Any))),
+        LuaType::Ref(_)
+        | LuaType::Def(_)
+        | LuaType::Generic(_)
+        | LuaType::Union(_)
+        | LuaType::MultiLineUnion(_)
+        | LuaType::Intersection(_) => {
+            let entry = relater.type_entry(source);
+            entry.member_type(relater.db(), source, key).map(Cow::Owned)
         }
         LuaType::Tuple(source_tuple) => match key {
-            LuaMemberKey::Integer(index) if *index > 0 => {
-                source_tuple.get_type(*index as usize - 1).cloned()
-            }
+            LuaMemberKey::Integer(index) if *index > 0 => source_tuple
+                .get_type(*index as usize - 1)
+                .map(Cow::Borrowed),
             _ => None,
         },
         LuaType::Array(source_array) => match key {
-            LuaMemberKey::Integer(index) if *index > 0 => Some(source_array.get_base().clone()),
+            LuaMemberKey::Integer(index) if *index > 0 => {
+                Some(Cow::Borrowed(source_array.get_base()))
+            }
             LuaMemberKey::TypeKey(key_type) if key_type.is_integer() => {
-                Some(source_array.get_base().clone())
+                Some(Cow::Borrowed(source_array.get_base()))
             }
             _ => None,
         },
@@ -147,9 +174,9 @@ pub(super) fn find_source_member_type(
                 return Ok(None);
             };
             match relater.probe_relation(&source_key_type, &source_params[0], intersection_state) {
-                RelationOutcome::Related => Some(source_params[1].clone()),
-                RelationOutcome::Unrelated => None,
-                RelationOutcome::Indeterminate(kind) => {
+                Ok(()) => Some(Cow::Borrowed(&source_params[1])),
+                Err(RelationFailure::Unrelated) => None,
+                Err(RelationFailure::Indeterminate(kind)) => {
                     return Err(RelationFailure::Indeterminate(kind));
                 }
             }
@@ -248,4 +275,56 @@ pub(in crate::semantic::type_check) fn unrelated_missing_members(
     keys: Vec<LuaMemberKey>,
 ) -> RelationResult {
     relater.fail(|db| missing_members_message(db, source, target, &keys))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        VirtualWorkspace,
+        semantic::{
+            cache::SemanticLocalCache,
+            type_check::{RelationFailure, probe_assignable},
+        },
+    };
+
+    #[test]
+    fn declared_sequences_use_all_duplicate_index_declarations() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CacheArrayValues<T>
+            ---@field [integer] T
+            ---@field [integer] number
+            ---@class CacheTupleValues<T>
+            ---@field [1] T
+            ---@field [1] number
+            ---@class CacheInheritedArray: CacheArrayValues<string>
+            ---@class CacheInheritedTuple: CacheTupleValues<string>
+        "#,
+        );
+        for (source, narrow, wide) in [
+            (
+                "CacheArrayValues<string>",
+                "string[]",
+                "(string | number)[]",
+            ),
+            ("CacheInheritedArray", "string[]", "(string | number)[]"),
+            ("CacheTupleValues<string>", "[string]", "[string | number]"),
+            ("CacheInheritedTuple", "[string]", "[string | number]"),
+        ] {
+            let source = ws.ty(source);
+            let narrow = ws.ty(narrow);
+            let wide = ws.ty(wide);
+            let db = ws.analysis.compilation.get_db();
+            let mut cache = SemanticLocalCache::default();
+            assert_eq!(
+                probe_assignable(db, &source, &narrow, Some(&mut cache)),
+                Err(RelationFailure::Unrelated)
+            );
+            assert_eq!(
+                probe_assignable(db, &source, &wide, Some(&mut cache)),
+                Ok(())
+            );
+        }
+    }
 }

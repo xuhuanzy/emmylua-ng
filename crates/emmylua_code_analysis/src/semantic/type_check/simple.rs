@@ -1,15 +1,15 @@
-use crate::{LuaType, semantic::type_check::error_chain::not_assignable_message};
+use crate::LuaType;
 
-use super::relation::{Relater, RelationResult};
+use super::fast_eq_check;
 
 #[inline(always)]
-pub(crate) fn relate_simple(
-    relater: &mut Relater,
-    source: &LuaType,
-    target: &LuaType,
-) -> Option<RelationResult> {
+pub(super) fn is_simple_assignable(source: &LuaType, target: &LuaType) -> Option<bool> {
+    if fast_eq_check(source, target) {
+        return Some(true);
+    }
+
     let (can_reject_simple_target_early, related) = match source {
-        LuaType::Unknown => return Some(Ok(())),
+        LuaType::Unknown => return Some(true),
         LuaType::Boolean => (
             true,
             matches!(target, LuaType::Boolean | LuaType::BooleanConst(_)),
@@ -79,20 +79,14 @@ pub(crate) fn relate_simple(
                 LuaType::Namespace(target_namespace) if source_namespace == target_namespace
             ),
         ),
-        LuaType::TableConst(_)
-        | LuaType::Tuple(_)
-        | LuaType::Array(_)
-        | LuaType::Object(_)
-        | LuaType::TableGeneric(_) => (false, false),
         LuaType::DocFunction(_) | LuaType::Signature(_) => {
             (false, matches!(target, LuaType::Function))
         }
-        LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => (false, false),
         _ => (false, false),
     };
 
     if related {
-        return Some(Ok(()));
+        return Some(true);
     }
 
     // source 可在入口阶段失败简单目标
@@ -120,7 +114,7 @@ pub(crate) fn relate_simple(
         | LuaType::Language(_)
             if can_reject_simple_target_early =>
         {
-            Some(relater.fail(|db| not_assignable_message(db, source, target)))
+            Some(false)
         }
         _ => None,
     }

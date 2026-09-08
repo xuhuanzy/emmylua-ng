@@ -137,7 +137,7 @@ fn infer_binary_custom_operator(
     {
         for operator in operators {
             let operand = operator.get_operand(db);
-            if is_assignable(db, right, &operand) {
+            if is_assignable(db, right, &operand, None) {
                 return operator.get_result(db);
             }
         }
@@ -149,7 +149,7 @@ fn infer_binary_custom_operator(
     {
         for operator in operators {
             let operand = operator.get_operand(db);
-            if is_assignable(db, left, &operand) {
+            if is_assignable(db, left, &operand, None) {
                 return operator.get_result(db);
             }
         }

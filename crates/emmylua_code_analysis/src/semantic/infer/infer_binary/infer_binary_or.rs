@@ -106,7 +106,7 @@ pub fn special_or_rule(
             let left_without_nil = remove_false_or_nil(left_type.clone());
             if table_expr.is_empty() {
                 // Remove nil/false from left type and check if result is table-compatible
-                if is_assignable(db, &LuaType::Table, &left_without_nil) {
+                if is_assignable(db, &LuaType::Table, &left_without_nil, None) {
                     // Only narrow if empty table can actually satisfy the type
                     // (i.e., the type has no required fields)
                     if can_empty_table_satisfy_type(db, &left_without_nil) {
@@ -114,7 +114,7 @@ pub fn special_or_rule(
                     }
                     // Otherwise, fall through to regular OR logic which will create a union
                 }
-            } else if is_assignable(db, right_type, &left_without_nil) {
+            } else if is_assignable(db, right_type, &left_without_nil, None) {
                 return Some(left_without_nil);
             }
         }
@@ -128,7 +128,7 @@ pub fn special_or_rule(
                 return None;
             }
 
-            if is_assignable(db, right_type, left_type) {
+            if is_assignable(db, right_type, left_type, None) {
                 return Some(remove_false_or_nil(left_type.clone()));
             }
         }

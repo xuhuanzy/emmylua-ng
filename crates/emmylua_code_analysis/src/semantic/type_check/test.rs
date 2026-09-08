@@ -5,7 +5,7 @@ mod test {
         LuaGenericType, LuaIndexAccessKey, LuaIntersectionType, LuaObjectType, LuaType,
         LuaTypeDeclId, LuaUnionType, VirtualWorkspace, is_assignable,
         semantic::type_check::{
-            AssignabilityResult, ErrorChain, RelationOutcome, check_assignable, probe_assignable,
+            AssignabilityResult, ErrorChain, RelationFailure, check_assignable, probe_assignable,
         },
     };
 
@@ -240,19 +240,19 @@ mod test {
         let db = ws.analysis.compilation.get_db();
 
         assert!(matches!(
-            check_assignable(db, &callable, &compatible),
+            check_assignable(db, &callable, &compatible, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &compatible, &callable),
+            check_assignable(db, &compatible, &callable, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &callable, &incompatible),
+            check_assignable(db, &callable, &incompatible, None),
             AssignabilityResult::NotAssignable(_)
         ));
         assert!(matches!(
-            check_assignable(db, &incompatible, &callable),
+            check_assignable(db, &incompatible, &callable, None),
             AssignabilityResult::NotAssignable(_)
         ));
     }
@@ -275,19 +275,19 @@ mod test {
         let db = ws.analysis.compilation.get_db();
 
         assert!(matches!(
-            check_assignable(db, &callable, &own_signature),
+            check_assignable(db, &callable, &own_signature, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &own_signature, &callable),
+            check_assignable(db, &own_signature, &callable, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &callable, &inherited_signature),
+            check_assignable(db, &callable, &inherited_signature, None),
             AssignabilityResult::NotAssignable(_)
         ));
         assert!(matches!(
-            check_assignable(db, &inherited_signature, &callable),
+            check_assignable(db, &inherited_signature, &callable, None),
             AssignabilityResult::NotAssignable(_)
         ));
     }
@@ -309,19 +309,19 @@ mod test {
         let db = ws.analysis.compilation.get_db();
 
         assert!(matches!(
-            check_assignable(db, &callable, &compatible),
+            check_assignable(db, &callable, &compatible, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &compatible, &callable),
+            check_assignable(db, &compatible, &callable, None),
             AssignabilityResult::Assignable
         ));
         assert!(matches!(
-            check_assignable(db, &callable, &incompatible),
+            check_assignable(db, &callable, &incompatible, None),
             AssignabilityResult::NotAssignable(_)
         ));
         assert!(matches!(
-            check_assignable(db, &incompatible, &callable),
+            check_assignable(db, &incompatible, &callable, None),
             AssignabilityResult::NotAssignable(_)
         ));
     }
@@ -441,13 +441,13 @@ mod test {
             target = LuaType::Array(LuaArrayType::from_base_type(target).into());
         }
 
-        assert!(is_assignable(&db, &source, &target));
+        assert!(is_assignable(&db, &source, &target, None));
         assert!(matches!(
-            probe_assignable(&db, &source, &target),
-            RelationOutcome::Indeterminate(_)
+            probe_assignable(&db, &source, &target, None),
+            Err(RelationFailure::Indeterminate(_))
         ));
         assert!(matches!(
-            check_assignable(&db, &source, &target),
+            check_assignable(&db, &source, &target, None),
             AssignabilityResult::Indeterminate(_)
         ));
     }
@@ -466,8 +466,8 @@ mod test {
         );
 
         assert_eq!(
-            probe_assignable(&db, &source, &target),
-            RelationOutcome::Unrelated
+            probe_assignable(&db, &source, &target, None),
+            Err(RelationFailure::Unrelated)
         );
     }
 
@@ -501,7 +501,7 @@ mod test {
         assert!(!ws.check_type(&source, &target));
 
         // 别名逐层展开后折叠为点路径, 最深层失败对收尾.
-        let chain = match check_assignable(ws.get_db_mut(), &source, &target) {
+        let chain = match check_assignable(ws.get_db_mut(), &source, &target, None) {
             AssignabilityResult::NotAssignable(chain) => chain.expect("chain must exist"),
             other => panic!("expected not assignable, got {:?}", other),
         };
@@ -571,7 +571,7 @@ mod test {
 
         let source = ws.ty("MixedVariance<string | number, string>");
         let target = ws.ty("MixedVariance<string, number>");
-        let chain = match check_assignable(ws.get_db_mut(), &source, &target) {
+        let chain = match check_assignable(ws.get_db_mut(), &source, &target, None) {
             AssignabilityResult::NotAssignable(chain) => chain.expect("chain must exist"),
             other => panic!("expected not assignable, got {:?}", other),
         };
@@ -760,17 +760,14 @@ mod test {
         let compatible = ws.ty("NodeB");
         let incompatible = ws.ty("WrongNode");
         let db = ws.analysis.compilation.get_db();
+        assert_eq!(probe_assignable(db, &source, &compatible, None), Ok(()));
         assert_eq!(
-            probe_assignable(db, &source, &compatible),
-            RelationOutcome::Related
-        );
-        assert_eq!(
-            check_assignable(db, &source, &compatible),
+            check_assignable(db, &source, &compatible, None),
             AssignabilityResult::Assignable
         );
         assert_eq!(
-            probe_assignable(db, &source, &incompatible),
-            RelationOutcome::Unrelated
+            probe_assignable(db, &source, &incompatible, None),
+            Err(RelationFailure::Unrelated)
         );
     }
 
@@ -860,12 +857,12 @@ mod test {
         let db = ws.analysis.compilation.get_db();
 
         assert_eq!(
-            check_assignable(db, &compatible, &target),
+            check_assignable(db, &compatible, &target, None),
             AssignabilityResult::Assignable
         );
         for source in [&incompatible, &missing] {
             assert!(matches!(
-                check_assignable(db, source, &target),
+                check_assignable(db, source, &target, None),
                 AssignabilityResult::NotAssignable(_)
             ));
         }
@@ -1346,16 +1343,13 @@ mod test {
         let target = LuaUnionType::Nullable(LuaType::String).into();
 
         assert_eq!(
-            probe_assignable(&db, &LuaType::String, &target),
-            RelationOutcome::Related
+            probe_assignable(&db, &LuaType::String, &target, None),
+            Ok(())
         );
+        assert_eq!(probe_assignable(&db, &LuaType::Nil, &target, None), Ok(()));
         assert_eq!(
-            probe_assignable(&db, &LuaType::Nil, &target),
-            RelationOutcome::Related
-        );
-        assert_eq!(
-            probe_assignable(&db, &LuaType::Number, &target),
-            RelationOutcome::Unrelated
+            probe_assignable(&db, &LuaType::Number, &target, None),
+            Err(RelationFailure::Unrelated)
         );
     }
 }

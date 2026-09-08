@@ -10,49 +10,73 @@ mod sub_type;
 mod test;
 mod union;
 
+use relation::{EvidenceMode, Relater};
+use simple::is_simple_assignable;
+
 pub use error_chain::{
     ChainMessage, ErrorChain, MissingMembersMessage, OverflowKind, chain_node, push_message,
 };
-pub(crate) use relation::RelationOutcome;
-use relation::RelationSession;
+pub use relation::AssignabilityResult;
+pub(crate) use relation::{IntersectionState, RelationFailure, RelationResult};
 pub use sub_type::is_sub_type_of;
 
 use crate::{
     BasicTypeKind, DbIndex, GenericTpl, LuaAliasCallKind, LuaType, LuaUnionType, TypeSubstitutor,
-    instantiate_type_generic,
+    instantiate_type_generic, semantic::cache::SemanticLocalCache,
 };
 
-/// 保守类型检查, 对于无法确定的类型关系也会返回 `true`, 仅在确定不兼容时返回 `false`.
-pub fn is_assignable(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
+/// 无法确定的关系按可赋值处理, 只有确定不兼容时才拒绝.
+pub(crate) fn is_assignable(
+    db: &DbIndex,
+    source: &LuaType,
+    target: &LuaType,
+    cache: Option<&mut SemanticLocalCache>,
+) -> bool {
     !matches!(
-        probe_assignable(db, source, target),
-        RelationOutcome::Unrelated
+        probe_assignable(db, source, target, cache),
+        Err(RelationFailure::Unrelated)
     )
 }
 
-pub fn probe_assignable(db: &DbIndex, source: &LuaType, target: &LuaType) -> RelationOutcome {
-    if fast_eq_check(source, target) {
-        return RelationOutcome::Related;
+pub(crate) fn probe_assignable(
+    db: &DbIndex,
+    source: &LuaType,
+    target: &LuaType,
+    cache: Option<&mut SemanticLocalCache>,
+) -> RelationResult {
+    if let Some(related) = is_simple_assignable(source, target) {
+        return if related {
+            Ok(())
+        } else {
+            Err(RelationFailure::Unrelated)
+        };
     }
-    RelationSession::probe(db, source, target)
+    let mut local_cache = None;
+    let cache = cache.unwrap_or_else(|| local_cache.insert(SemanticLocalCache::default()));
+    Relater::new(db, cache, EvidenceMode::Silent).relate_complex(
+        source,
+        target,
+        IntersectionState::NONE,
+    )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssignabilityResult {
-    Assignable,
-    NotAssignable(Option<ErrorChain>),
-    Indeterminate(OverflowKind),
-}
-
-pub fn check_assignable(db: &DbIndex, source: &LuaType, target: &LuaType) -> AssignabilityResult {
-    if fast_eq_check(source, target) {
-        return AssignabilityResult::Assignable;
+pub(crate) fn check_assignable(
+    db: &DbIndex,
+    source: &LuaType,
+    target: &LuaType,
+    cache: Option<&mut SemanticLocalCache>,
+) -> AssignabilityResult {
+    let mut local_cache = None;
+    let cache = cache.unwrap_or_else(|| local_cache.insert(SemanticLocalCache::default()));
+    let mut relater = Relater::new(db, cache, EvidenceMode::Explain);
+    match relater.relate(source, target, IntersectionState::NONE) {
+        Ok(()) => AssignabilityResult::Assignable,
+        Err(RelationFailure::Unrelated) => AssignabilityResult::NotAssignable(relater.error_chain),
+        Err(RelationFailure::Indeterminate(kind)) => AssignabilityResult::Indeterminate(kind),
     }
-
-    RelationSession::explain(db, source, target)
 }
 
-#[inline]
+#[inline(always)]
 pub fn fast_eq_check(source: &LuaType, target: &LuaType) -> bool {
     match (source, target) {
         (LuaType::Ref(a) | LuaType::Def(a), LuaType::Ref(b) | LuaType::Def(b)) => a == b,
@@ -114,46 +138,6 @@ pub fn fast_eq_check(source: &LuaType, target: &LuaType) -> bool {
 }
 
 #[inline(always)]
-fn accept_reflexive_or_semantic(source: &LuaType, target: &LuaType) -> bool {
-    match (source, target) {
-        (LuaType::Any, _)
-        | (_, LuaType::Any | LuaType::Unknown)
-        | (LuaType::SelfInfer, _)
-        | (_, LuaType::SelfInfer) => true,
-        (LuaType::Ref(a) | LuaType::Def(a), LuaType::Ref(b) | LuaType::Def(b)) => a == b,
-        (LuaType::Object(a), LuaType::Object(b)) => Arc::ptr_eq(a, b),
-        (LuaType::Union(a), LuaType::Union(b)) => Arc::ptr_eq(a, b),
-        (LuaType::MultiLineUnion(a), LuaType::MultiLineUnion(b)) => Arc::ptr_eq(a, b),
-        (LuaType::Array(a), LuaType::Array(b)) => Arc::ptr_eq(a, b),
-        (LuaType::Tuple(a), LuaType::Tuple(b)) => Arc::ptr_eq(a, b),
-        (LuaType::DocFunction(a), LuaType::DocFunction(b)) => Arc::ptr_eq(a, b),
-        (LuaType::Generic(a), LuaType::Generic(b)) => Arc::ptr_eq(a, b),
-        (LuaType::TableGeneric(a), LuaType::TableGeneric(b)) => Arc::ptr_eq(a, b),
-        (LuaType::TableConst(a), LuaType::TableConst(b)) => a == b,
-        (
-            LuaType::StringConst(a) | LuaType::DocStringConst(a),
-            LuaType::StringConst(b) | LuaType::DocStringConst(b),
-        ) => a == b,
-        (
-            LuaType::IntegerConst(a) | LuaType::DocIntegerConst(a),
-            LuaType::IntegerConst(b) | LuaType::DocIntegerConst(b),
-        ) => a == b,
-        (
-            LuaType::BooleanConst(a) | LuaType::DocBooleanConst(a),
-            LuaType::BooleanConst(b) | LuaType::DocBooleanConst(b),
-        ) => a == b,
-        (LuaType::Signature(a), LuaType::Signature(b)) => a == b,
-        (LuaType::Namespace(a), LuaType::Namespace(b)) => a == b,
-        (LuaType::ModuleRef(a), LuaType::ModuleRef(b)) => a == b,
-        (LuaType::Language(a), LuaType::Language(b)) => a == b,
-        (LuaType::StrTplRef(a), LuaType::StrTplRef(b)) => Arc::ptr_eq(a, b),
-        (LuaType::TplRef(tpl), _) | (_, LuaType::TplRef(tpl)) if tpl.get_constraint().is_none() => {
-            true
-        }
-        _ => false,
-    }
-}
-
 pub fn normalize_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     // 禁止在此对泛型进行展开
     match typ {

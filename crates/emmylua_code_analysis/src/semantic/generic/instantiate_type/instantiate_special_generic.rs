@@ -4,7 +4,7 @@ use crate::{
     semantic::{
         generic::key_type_to_member_key,
         member::{find_index_operations, find_members, infer_raw_member_type},
-        type_check,
+        type_check::probe_assignable,
     },
 };
 use hashbrown::HashMap;
@@ -70,10 +70,7 @@ pub(super) fn instantiate_alias_call(
                 );
             }
 
-            let compact = matches!(
-                type_check::probe_assignable(context.db, &operands[0], &operands[1],),
-                type_check::RelationOutcome::Related
-            );
+            let compact = probe_assignable(context.db, &operands[0], &operands[1], None).is_ok();
             LuaType::BooleanConst(compact)
         }
         LuaAliasCallKind::Select => {

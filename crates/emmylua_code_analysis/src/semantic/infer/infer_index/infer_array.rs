@@ -69,7 +69,7 @@ fn key_type_matches(db: &DbIndex, expected: &LuaType, actual: &LuaType) -> bool 
     !matches!(
         actual,
         LuaType::Any | LuaType::Unknown | LuaType::TplRef(_) | LuaType::StrTplRef(_)
-    ) && is_assignable(db, actual, expected)
+    ) && is_assignable(db, actual, expected, None)
 }
 
 pub(super) fn array_member_fallback(db: &DbIndex, base: &LuaType) -> LuaType {

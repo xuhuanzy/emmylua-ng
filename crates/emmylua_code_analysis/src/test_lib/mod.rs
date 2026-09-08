@@ -141,7 +141,7 @@ impl VirtualWorkspace {
     }
 
     pub fn check_type(&self, source: &LuaType, target: &LuaType) -> bool {
-        is_assignable(self.analysis.compilation.get_db(), source, target)
+        is_assignable(self.analysis.compilation.get_db(), source, target, None)
     }
 
     pub fn enable_check(&mut self, diagnostic_code: DiagnosticCode) {

@@ -3,10 +3,8 @@ use rowan::TextRange;
 
 use crate::{
     AssignabilityResult, DiagnosticCode, ErrorChain, LuaFunctionType, LuaType, RenderLevel,
-    SemanticModel,
-    diagnostic::checker::table::check_table_assignment_diagnostics,
-    humanize_type,
-    semantic::{RelationOutcome, get_func_param_type, probe_assignable},
+    SemanticModel, diagnostic::checker::table::check_table_assignment_diagnostics, humanize_type,
+    semantic::get_func_param_type,
 };
 
 use super::{
@@ -196,10 +194,9 @@ fn check_arg_index_candidates<'func, 'arg>(
         // Any, 整数型浮点常量和关系上可兼容的类型都保留当前候选.
         if param_type.is_any()
             || matches!((&param_type, arg.typ), (LuaType::Integer, LuaType::FloatConst(value)) if value.fract() == 0.0)
-            || matches!(
-                probe_assignable(semantic_model.get_db(), arg.typ, &param_type),
-                RelationOutcome::Related
-            )
+            || semantic_model
+                .probe_assignable(arg.typ, &param_type)
+                .is_ok()
         {
             next_candidates.push(func);
             continue;

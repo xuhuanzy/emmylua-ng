@@ -5,9 +5,7 @@ use crate::{
     },
 };
 
-use super::super::relation::{
-    IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult,
-};
+use super::super::relation::{IntersectionState, Relater, RelationFailure, RelationResult};
 use super::{member::visit_members, tuple::visit_tuple_index_entries};
 
 #[derive(Clone, Copy)]
@@ -86,18 +84,18 @@ pub(super) fn relate_index_member(
     visit_index_entries(relater, source, |relater, key, value, origin| {
         relater.consume_relation_budget()?;
         match relater.probe_relation(key, target_key_type, intersection_state) {
-            RelationOutcome::Related => {
+            Ok(()) => {
                 let result = relater.relate(value, target_value_type, intersection_state);
                 relater.on_unrelated(result, |db| index_message(db, key))
             }
-            RelationOutcome::Unrelated => {
+            Err(RelationFailure::Unrelated) => {
                 if matches!(origin, EntryOrigin::Tuple(_)) && matches!(key, LuaType::Integer) {
                     relater.fail(|db| not_assignable_message(db, source, target))
                 } else {
                     Ok(())
                 }
             }
-            RelationOutcome::Indeterminate(kind) => Err(RelationFailure::Indeterminate(kind)),
+            Err(RelationFailure::Indeterminate(kind)) => Err(RelationFailure::Indeterminate(kind)),
         }
     })
 }

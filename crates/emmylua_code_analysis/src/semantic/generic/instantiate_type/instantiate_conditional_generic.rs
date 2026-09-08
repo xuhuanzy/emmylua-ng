@@ -5,10 +5,7 @@ use crate::{
     DbIndex, GenericTpl, GenericTplId, LuaConditionalType, LuaTypeDeclId, LuaTypeNode, TypeOps,
     db_index::{LuaObjectType, LuaTupleType, LuaType},
     is_assignable,
-    semantic::{
-        member::find_members_with_key,
-        type_check::{RelationOutcome, probe_assignable},
-    },
+    semantic::{member::find_members_with_key, type_check::probe_assignable},
 };
 
 use super::{get_default_constructor, instantiate_type_generic_inner};
@@ -239,10 +236,7 @@ fn check_conditional_extends(db: &DbIndex, source: &LuaType, target: &LuaType) -
         return ConditionalCheck::False;
     }
 
-    if matches!(
-        probe_assignable(db, source, target),
-        RelationOutcome::Related
-    ) {
+    if probe_assignable(db, source, target, None).is_ok() {
         ConditionalCheck::True
     } else {
         ConditionalCheck::False
@@ -571,7 +565,7 @@ fn strict_type_match(db: &DbIndex, source: &LuaType, pattern: &LuaType) -> bool 
         return true;
     }
 
-    is_assignable(db, source, pattern)
+    is_assignable(db, source, pattern, None)
 }
 
 fn is_optional_param_type(db: &DbIndex, ty: &LuaType) -> bool {

@@ -3,7 +3,7 @@ use crate::{
 };
 
 use super::{
-    relation::{IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult},
+    relation::{IntersectionState, Relater, RelationFailure, RelationResult},
     structured::{dispatch_structured, relate_target_intersection_index_members},
 };
 
@@ -89,11 +89,11 @@ fn relate_source_intersection(
     for (index, member) in source_intersection.get_types().iter().enumerate() {
         let outcome = relater.probe_relation(member, target, constituent_state);
         match outcome {
-            RelationOutcome::Related => related = true,
-            RelationOutcome::Indeterminate(kind) => {
+            Ok(()) => related = true,
+            Err(RelationFailure::Indeterminate(kind)) => {
                 indeterminate.get_or_insert(kind);
             }
-            RelationOutcome::Unrelated => {
+            Err(RelationFailure::Unrelated) => {
                 best.get_or_insert(index);
             }
         }

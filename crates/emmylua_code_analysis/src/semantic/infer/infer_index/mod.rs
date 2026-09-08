@@ -488,7 +488,7 @@ fn infer_matching_member_key_type(
             continue;
         };
 
-        if is_assignable(db, &member_key_type, key_type) {
+        if is_assignable(db, &member_key_type, key_type, None) {
             let member_type = db
                 .get_type_index()
                 .get_type_cache(&member.get_id().into())
@@ -617,7 +617,7 @@ fn infer_index_metamethod_by_key_type(
     key_type: &LuaType,
     value_type: &LuaType,
 ) -> InferResult {
-    if is_assignable(db, access_key_type, key_type) {
+    if is_assignable(db, access_key_type, key_type, None) {
         return Ok(value_type.clone());
     }
 

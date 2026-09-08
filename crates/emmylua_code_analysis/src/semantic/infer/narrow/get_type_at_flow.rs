@@ -1987,7 +1987,7 @@ fn is_partial_assignment_expr_compatible(
     source_type: &LuaType,
     expr_type: &LuaType,
 ) -> bool {
-    if is_assignable(db, expr_type, source_type) {
+    if is_assignable(db, expr_type, source_type, None) {
         return true;
     }
 

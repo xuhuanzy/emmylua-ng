@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::{
     LuaFunctionType, LuaType, collect_callable_overload_groups,
     semantic::type_check::{
@@ -6,9 +8,7 @@ use crate::{
     },
 };
 
-use super::relation::{
-    IntersectionState, Relater, RelationFailure, RelationOutcome, RelationResult,
-};
+use super::relation::{IntersectionState, Relater, RelationFailure, RelationResult};
 
 pub(crate) fn relate_callable(
     relater: &mut Relater,
@@ -86,14 +86,14 @@ fn relate_to_callable_targets(
         let mut first_unrelated = None;
         for (source_index, source_candidate) in source_candidates.iter().enumerate() {
             match relater.probe_relation(source_candidate, target_candidate, intersection_state) {
-                RelationOutcome::Related => {
+                Ok(()) => {
                     target_related = true;
                     break;
                 }
-                RelationOutcome::Indeterminate(kind) => {
+                Err(RelationFailure::Indeterminate(kind)) => {
                     target_indeterminate.get_or_insert(kind);
                 }
-                RelationOutcome::Unrelated => {
+                Err(RelationFailure::Unrelated) => {
                     first_unrelated.get_or_insert(source_index);
                 }
             }
@@ -201,22 +201,28 @@ fn relate_function(
     Ok(())
 }
 
-fn callable_candidates(relater: &Relater, typ: &LuaType) -> Option<Vec<LuaType>> {
+fn callable_candidates(relater: &mut Relater, typ: &LuaType) -> Option<Rc<[LuaType]>> {
     if let Some(normalized) = normalize_type(relater.db(), typ)
         && normalized != *typ
     {
         return callable_candidates(relater, &normalized);
     }
     if matches!(typ, LuaType::Function) {
-        return Some(vec![LuaType::Function]);
+        return Some(Rc::from([LuaType::Function]));
     }
 
-    let mut overload_groups = Vec::new();
-    collect_callable_overload_groups(relater.db(), typ, &mut overload_groups).ok()?;
-    let candidates = overload_groups
-        .into_iter()
-        .flatten()
-        .map(LuaType::DocFunction)
-        .collect::<Vec<_>>();
-    (!candidates.is_empty()).then_some(candidates)
+    let entry = relater.type_entry(typ);
+    entry
+        .call_signatures
+        .get_or_init(|| {
+            let mut overload_groups = Vec::new();
+            collect_callable_overload_groups(relater.db(), typ, &mut overload_groups).ok()?;
+            let candidates = overload_groups
+                .into_iter()
+                .flatten()
+                .map(LuaType::DocFunction)
+                .collect::<Vec<_>>();
+            (!candidates.is_empty()).then(|| Rc::from(candidates))
+        })
+        .clone()
 }

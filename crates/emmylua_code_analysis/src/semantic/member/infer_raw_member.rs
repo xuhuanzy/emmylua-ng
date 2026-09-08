@@ -193,7 +193,7 @@ fn infer_custom_type_raw_member_type(
                 continue;
             };
 
-            if !is_assignable(db, &access_key_type, index_key_type) {
+            if !is_assignable(db, &access_key_type, index_key_type, None) {
                 continue;
             }
 
@@ -261,7 +261,7 @@ fn infer_object_raw_member_type(
             continue;
         };
 
-        if is_assignable(db, &access_key_type, key) {
+        if is_assignable(db, &access_key_type, key, None) {
             return Ok(value.clone());
         }
     }
@@ -306,7 +306,7 @@ fn infer_table_generic_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    if is_assignable(db, &access_key_type, key_type) {
+    if is_assignable(db, &access_key_type, key_type, None) {
         return Ok(value_type.clone());
     }
 

@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cache::SemanticLocalCache;
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use emmylua_parser::{
@@ -39,7 +40,11 @@ pub(crate) use semantic_info::{infer_node_semantic_decl, resolve_global_decl_id}
 use semantic_info::{
     infer_node_semantic_info, infer_token_semantic_decl, infer_token_semantic_info,
 };
-pub(crate) use type_check::{RelationOutcome, is_sub_type_of, probe_assignable};
+use type_check::fast_eq_check;
+pub(crate) use type_check::{
+    RelationFailure, RelationResult, check_assignable, is_assignable, is_sub_type_of,
+    probe_assignable,
+};
 pub use visibility::check_module_visibility;
 use visibility::check_visibility;
 
@@ -67,7 +72,7 @@ pub use overload_resolve::{
 pub use semantic_info::SemanticDeclLevel;
 pub use type_check::{
     AssignabilityResult, ChainMessage, ErrorChain, MissingMembersMessage, OverflowKind, chain_node,
-    check_assignable, is_assignable, is_optional, push_message,
+    is_optional, push_message,
 };
 
 pub use generic::get_keyof_members;
@@ -80,6 +85,7 @@ pub struct SemanticModel<'a> {
     infer_cache: RefCell<LuaInferCache>,
     emmyrc: Arc<Emmyrc>,
     root: LuaChunk,
+    cache: RefCell<SemanticLocalCache>,
 }
 
 unsafe impl<'a> Send for SemanticModel<'a> {}
@@ -99,6 +105,7 @@ impl<'a> SemanticModel<'a> {
             infer_cache: RefCell::new(infer_config),
             emmyrc,
             root,
+            cache: RefCell::new(SemanticLocalCache::default()),
         }
     }
 
@@ -177,11 +184,24 @@ impl<'a> SemanticModel<'a> {
     }
 
     pub fn is_assignable(&self, source: &LuaType, target: &LuaType) -> bool {
-        is_assignable(self.db, source, target)
+        !matches!(
+            self.probe_assignable(source, target),
+            Err(RelationFailure::Unrelated)
+        )
+    }
+
+    pub(crate) fn probe_assignable(&self, source: &LuaType, target: &LuaType) -> RelationResult {
+        if fast_eq_check(source, target) {
+            return Ok(());
+        }
+        probe_assignable(self.db, source, target, Some(&mut self.cache.borrow_mut()))
     }
 
     pub fn check_assignable(&self, source: &LuaType, target: &LuaType) -> AssignabilityResult {
-        check_assignable(self.db, source, target)
+        if fast_eq_check(source, target) {
+            return AssignabilityResult::Assignable;
+        }
+        check_assignable(self.db, source, target, Some(&mut self.cache.borrow_mut()))
     }
 
     pub fn infer_call_expr_func(

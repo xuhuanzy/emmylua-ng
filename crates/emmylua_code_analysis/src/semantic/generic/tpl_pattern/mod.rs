@@ -245,9 +245,9 @@ fn object_tpl_pattern_match(
             let target_index_access = target_object.get_index_access();
             for (origin_key, v) in origin_obj.get_index_access() {
                 // 先匹配 key 类型进行转换
-                let target_access = target_index_access
-                    .iter()
-                    .find(|(target_key, _)| is_assignable(context.db, target_key, origin_key));
+                let target_access = target_index_access.iter().find(|(target_key, _)| {
+                    is_assignable(context.db, target_key, origin_key, None)
+                });
                 if let Some(target_access) = target_access {
                     tpl_pattern_match(context, origin_key, &target_access.0)?;
                     tpl_pattern_match(context, v, &target_access.1)?;
@@ -499,7 +499,8 @@ fn table_generic_tpl_pattern_member_owner_match(
             _ => continue,
         };
 
-        if !target_key_type.is_generic() && !is_assignable(context.db, &key_type, &target_key_type)
+        if !target_key_type.is_generic()
+            && !is_assignable(context.db, &key_type, &target_key_type, None)
         {
             continue;
         }
@@ -533,7 +534,7 @@ fn table_generic_tpl_pattern_member_owner_match(
                     LuaMemberKey::TypeKey(typ) => typ.clone(),
                     _ => return,
                 };
-                if is_assignable(context.db, &key_type, &target_key_type) {
+                if is_assignable(context.db, &key_type, &target_key_type, None) {
                     keys.push(key_type);
                     values.push(m.typ.clone());
                 }

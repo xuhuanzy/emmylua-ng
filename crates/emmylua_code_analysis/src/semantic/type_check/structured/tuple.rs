@@ -1,6 +1,5 @@
 use crate::{
     LuaArrayType, LuaMemberKey, LuaObjectType, LuaTupleType, LuaType, VariadicType,
-    find_members_with_key,
     semantic::type_check::error_chain::{
         ChainMessage, index_message, missing_members_message, not_assignable_message,
     },
@@ -12,9 +11,10 @@ use super::super::{
 };
 use super::{
     array::effective_array_base,
-    declared::visit_declared_members,
     index::relate_index_member,
-    member::{probe_missing_member, unrelated_missing_members},
+    member::{
+        find_source_member_type, probe_missing_member, unrelated_missing_members, visit_members,
+    },
 };
 
 pub(super) fn relate_tuple_to_tuple(
@@ -164,9 +164,7 @@ pub(super) fn relate_keyed_source_to_tuple(
     for (index, target_type) in target_tuple.get_types().iter().enumerate() {
         relater.consume_relation_budget()?;
         let key = LuaMemberKey::Integer(index as i64 + 1);
-        let source_type = find_members_with_key(relater.db(), source, key, false)
-            .and_then(|members| members.into_iter().next())
-            .map(|member| member.typ);
+        let source_type = find_source_member_type(relater, source, &key, intersection_state)?;
         let Some(source_type) = source_type else {
             if is_optional(relater.db(), target_type) {
                 continue;
@@ -239,7 +237,7 @@ pub(super) fn relate_tuple_to_declared_target(
 ) -> RelationResult {
     if relater.is_explain() {
         let mut missing_keys = Vec::new();
-        visit_declared_members(relater, target, |relater, key, target_member_type| {
+        visit_members(relater, target, |relater, key, target_member_type| {
             if !matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::None) {
                 return Ok(());
             }
@@ -255,50 +253,48 @@ pub(super) fn relate_tuple_to_declared_target(
 
     // 检查是否含有必需的命名字段
     let mut has_integer_or_index = false;
-    let result =
-        visit_declared_members(
-            relater,
-            target,
-            |relater, key, target_member_type| match key {
-                LuaMemberKey::Integer(idx) if *idx > 0 => {
-                    has_integer_or_index = true;
-                    let index = (*idx - 1) as usize;
-                    let Some(source_type) = source_tuple.get_type(index) else {
-                        if is_optional(relater.db(), target_member_type) {
-                            return Ok(());
-                        }
-                        return relater.fail(|db| not_assignable_message(db, source, target));
-                    };
-                    relater.consume_relation_budget()?;
-                    let result =
-                        relater.relate(source_type, target_member_type, intersection_state);
-                    relater.on_unrelated(result, |_| ChainMessage::TupleElement { index })?;
-                    Ok(())
-                }
-                LuaMemberKey::TypeKey(target_key_type) => {
-                    has_integer_or_index = true;
-                    if intersection_state.contains(IntersectionState::TARGET) {
+    let result = visit_members(
+        relater,
+        target,
+        |relater, key, target_member_type| match key {
+            LuaMemberKey::Integer(idx) if *idx > 0 => {
+                has_integer_or_index = true;
+                let index = (*idx - 1) as usize;
+                let Some(source_type) = source_tuple.get_type(index) else {
+                    if is_optional(relater.db(), target_member_type) {
                         return Ok(());
                     }
-                    relate_index_member(
-                        relater,
-                        source,
-                        target,
-                        target_key_type,
-                        target_member_type,
-                        intersection_state,
-                    )
+                    return relater.fail(|db| not_assignable_message(db, source, target));
+                };
+                relater.consume_relation_budget()?;
+                let result = relater.relate(source_type, target_member_type, intersection_state);
+                relater.on_unrelated(result, |_| ChainMessage::TupleElement { index })?;
+                Ok(())
+            }
+            LuaMemberKey::TypeKey(target_key_type) => {
+                has_integer_or_index = true;
+                if intersection_state.contains(IntersectionState::TARGET) {
+                    return Ok(());
                 }
-                _ => {
-                    if !is_optional(relater.db(), target_member_type) {
-                        return relater.fail(|db| {
-                            missing_members_message(db, source, target, std::slice::from_ref(key))
-                        });
-                    }
-                    Ok(())
+                relate_index_member(
+                    relater,
+                    source,
+                    target,
+                    target_key_type,
+                    target_member_type,
+                    intersection_state,
+                )
+            }
+            _ => {
+                if !is_optional(relater.db(), target_member_type) {
+                    return relater.fail(|db| {
+                        missing_members_message(db, source, target, std::slice::from_ref(key))
+                    });
                 }
-            },
-        );
+                Ok(())
+            }
+        },
+    );
 
     if result.is_ok() && !has_integer_or_index {
         return relater.fail(|db| not_assignable_message(db, source, target));
