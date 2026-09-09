@@ -7,10 +7,7 @@ use super::super::{
     is_optional,
     relation::{IntersectionState, Relater, RelationResult},
 };
-use super::{
-    index::relate_index_member,
-    member::{find_source_member_type, visit_members},
-};
+use super::{index::relate_index_member, member::MemberView};
 
 #[inline(always)]
 pub(in crate::semantic::type_check) fn relate_array_to_array(
@@ -120,9 +117,9 @@ pub(super) fn relate_keyed_source_to_array(
 ) -> RelationResult {
     let target_base = effective_array_base(relater, target_array.get_base());
     relater.consume_relation_budget()?;
-    let source_type = find_source_member_type(
+    let source_members = MemberView::new(relater, source);
+    let source_type = source_members.member_type(
         relater,
-        source,
         &LuaMemberKey::TypeKey(LuaType::Integer),
         intersection_state,
     )?;
@@ -192,9 +189,8 @@ pub(super) fn relate_array_to_declared_target(
 ) -> RelationResult {
     // 检查是否有整数索引或索引访问, 如果没有, 则不兼容
     let mut has_integer_or_index = false;
-    let result = visit_members(
+    let result = MemberView::new(relater, target).visit_types(
         relater,
-        target,
         |relater, key, target_member_type| match key {
             LuaMemberKey::Integer(idx) if *idx > 0 => {
                 has_integer_or_index = true;

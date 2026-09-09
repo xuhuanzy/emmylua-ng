@@ -2,6 +2,7 @@ use std::{cell::OnceCell, rc::Rc};
 
 use hashbrown::HashSet;
 use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 use smol_str::SmolStr;
 
 use crate::{
@@ -31,14 +32,12 @@ impl TypeCacheEntry {
         db: &DbIndex,
         typ: &LuaType,
         key: &LuaMemberKey,
-    ) -> Option<LuaType> {
-        self.members(db, typ)
-            .get(key)
-            .map(|member| member.typ(db).clone())
+    ) -> Option<&LuaType> {
+        self.members(db, typ).get(key).map(|member| member.typ(db))
     }
 }
 
-pub(in crate::semantic) type TypeMembers = IndexMap<LuaMemberKey, MemberSymbol>;
+pub(in crate::semantic) type TypeMembers = IndexMap<LuaMemberKey, MemberSymbol, FxBuildHasher>;
 
 #[derive(Debug)]
 enum MemberOrigin {
@@ -128,7 +127,7 @@ impl<'db> MemberCollector<'db> {
         substitutor: Option<Rc<TypeSubstitutor>>,
     ) -> Option<TypeMembers> {
         let db = self.db;
-        let mut members = TypeMembers::new();
+        let mut members = TypeMembers::default();
         match typ {
             LuaType::Never => return None,
             LuaType::Ref(id) | LuaType::Def(id) => {
@@ -210,7 +209,7 @@ impl<'db> MemberCollector<'db> {
             }
             LuaType::Union(union) => return self.collect_union(union, substitutor),
             LuaType::Intersection(intersection) => {
-                let mut combined: IndexMap<_, Vec<_>> = IndexMap::new();
+                let mut combined: IndexMap<_, Vec<_>, FxBuildHasher> = IndexMap::default();
                 for typ in intersection.get_types() {
                     for (key, member) in self.collect(typ, substitutor.clone())? {
                         combined.entry(key).or_default().push(member);
@@ -312,7 +311,7 @@ impl<'db> MemberCollector<'db> {
         let db = self.db;
         let type_index = db.get_type_index();
         let Some(decl) = type_index.get_type_decl(id) else {
-            return Some(TypeMembers::new());
+            return Some(TypeMembers::default());
         };
         let params: Option<Vec<_>> = params.map(|params| {
             params
@@ -328,7 +327,7 @@ impl<'db> MemberCollector<'db> {
         };
         // 别名按实参区分嵌套展开, 同时限制实参不断增长的递归.
         if self.visiting.len() >= 128 || !self.visiting.insert(visiting_type.clone()) {
-            return Some(TypeMembers::new());
+            return Some(TypeMembers::default());
         }
         let substitutor = params.map(|params| {
             Rc::new(if decl.is_alias() {
@@ -341,7 +340,7 @@ impl<'db> MemberCollector<'db> {
         let members = if decl.is_alias() {
             match decl.get_alias_ref() {
                 Some(origin) => self.collect(origin, substitutor),
-                None => Some(TypeMembers::new()),
+                None => Some(TypeMembers::default()),
             }
         } else {
             let mut members = self.collect_owner(&LuaMemberOwner::Type(id.clone()), &substitutor);
@@ -366,7 +365,7 @@ impl<'db> MemberCollector<'db> {
         owner: &LuaMemberOwner,
         substitutor: &Option<Rc<TypeSubstitutor>>,
     ) -> TypeMembers {
-        let mut members = TypeMembers::new();
+        let mut members = TypeMembers::default();
         if let Some(items) = self.db.get_member_index().get_member_items(owner) {
             for (key, item) in items {
                 self.insert(
@@ -385,7 +384,7 @@ impl<'db> MemberCollector<'db> {
         union: &LuaUnionType,
         substitutor: Option<Rc<TypeSubstitutor>>,
     ) -> Option<TypeMembers> {
-        let mut common: Option<IndexMap<_, Vec<_>>> = None;
+        let mut common: Option<IndexMap<_, Vec<_>, FxBuildHasher>> = None;
         for branch in union.iter() {
             let Some(mut members) = self.collect(&branch, substitutor.clone()) else {
                 continue;
@@ -518,7 +517,7 @@ mod test {
                     .map(|member| member.typ);
                 for _ in 0..2 {
                     assert_eq!(
-                        entry.member_type(db, typ, key),
+                        entry.member_type(db, typ, key).cloned(),
                         expected,
                         "{typ:?}, {key:?}"
                     );
@@ -586,11 +585,16 @@ mod test {
                     LuaMemberKey::Name("common".into()),
                     LuaMemberKey::Integer(1),
                 ] {
-                    assert_eq!(entry.member_type(db, typ, &key), Some(expected.clone()));
+                    assert_eq!(
+                        entry.member_type(db, typ, &key).cloned(),
+                        Some(expected.clone())
+                    );
                 }
                 for key in ["left", "right"] {
                     assert_eq!(
-                        entry.member_type(db, typ, &LuaMemberKey::Name(key.into())),
+                        entry
+                            .member_type(db, typ, &LuaMemberKey::Name(key.into()))
+                            .cloned(),
                         None
                     );
                 }
@@ -598,11 +602,10 @@ mod test {
             assert!(entry.call_signatures.get().is_none());
         }
         assert_eq!(
-            cache.type_entry(&override_type).member_type(
-                db,
-                &override_type,
-                &LuaMemberKey::Name("common".into()),
-            ),
+            cache
+                .type_entry(&override_type)
+                .member_type(db, &override_type, &LuaMemberKey::Name("common".into()),)
+                .cloned(),
             Some(LuaType::Boolean)
         );
     }
@@ -660,7 +663,9 @@ mod test {
             if let Some((key, value)) = index {
                 assert_eq!(members.len(), 1, "{typ:?}");
                 assert_eq!(
-                    entry.member_type(db, &typ, &LuaMemberKey::TypeKey(key)),
+                    entry
+                        .member_type(db, &typ, &LuaMemberKey::TypeKey(key))
+                        .cloned(),
                     Some(value),
                     "{typ:?}"
                 );
@@ -687,7 +692,10 @@ mod test {
             assert!(branches.iter().all(|member| member.typ.get().is_none()));
         }
         let key = LuaMemberKey::Name("used".into());
-        assert_eq!(entry.member_type(db, &source, &key), Some(expected));
+        assert_eq!(
+            entry.member_type(db, &source, &key).cloned(),
+            Some(expected)
+        );
         let used = &members[&key];
         let MemberOrigin::Union(branches) = &used.origin else {
             panic!("expected a union member");
@@ -741,7 +749,9 @@ mod test {
         assert!(entry.members(db, &cycle).is_empty());
         let entry = TypeCacheEntry::default();
         assert_eq!(
-            entry.member_type(db, &duplicate, &LuaMemberKey::Name("value".into())),
+            entry
+                .member_type(db, &duplicate, &LuaMemberKey::Name("value".into()))
+                .cloned(),
             Some(expected)
         );
     }
@@ -821,7 +831,10 @@ mod test {
         assert!(entry.call_signatures.get().is_none());
 
         let key = LuaMemberKey::Name("used".into());
-        assert_eq!(entry.member_type(db, &typ, &key), Some(LuaType::String));
+        assert_eq!(
+            entry.member_type(db, &typ, &key).cloned(),
+            Some(LuaType::String)
+        );
         let members = entry.members.get().unwrap();
         assert_eq!(members.len(), 3);
         let index_member = &members[&LuaMemberKey::TypeKey(LuaType::String)];
@@ -859,13 +872,13 @@ mod test {
             assert!(enumerated.typ.get().is_none());
             let (first, second) = if lookup_first {
                 (
-                    entry.member_type(db, &typ, &key).unwrap(),
+                    entry.member_type(db, &typ, &key).cloned().unwrap(),
                     enumerated.typ(db).clone(),
                 )
             } else {
                 (
                     enumerated.typ(db).clone(),
-                    entry.member_type(db, &typ, &key).unwrap(),
+                    entry.member_type(db, &typ, &key).cloned().unwrap(),
                 )
             };
             let (LuaType::Array(first), LuaType::Array(second)) = (first, second) else {
@@ -904,7 +917,7 @@ mod test {
             .remove(0)
             .typ;
         assert_eq!(enumerated.typ(db), &expected);
-        assert_eq!(entry.member_type(db, &typ, &key), Some(expected));
+        assert_eq!(entry.member_type(db, &typ, &key).cloned(), Some(expected));
     }
 
     #[test]
@@ -933,7 +946,10 @@ mod test {
         let members = entry.members(db, &typ);
         assert_eq!(members.len(), 1);
         assert!(members[&key].typ.get().is_none());
-        assert_eq!(entry.member_type(db, &typ, &key), Some(union.clone()));
+        assert_eq!(
+            entry.member_type(db, &typ, &key).cloned(),
+            Some(union.clone())
+        );
         let (_, member) = members.iter().next().unwrap();
         assert_eq!(member.typ(db), &union);
         assert!(!is_assignable(db, &typ, &string_field, Some(&mut cache)));
@@ -975,7 +991,10 @@ mod test {
             let members = entry.members(db, typ);
             assert_eq!(members.len(), 1);
             assert!(members[&key].typ.get().is_none());
-            assert_eq!(entry.member_type(db, typ, &key), Some(LuaType::Unknown));
+            assert_eq!(
+                entry.member_type(db, typ, &key).cloned(),
+                Some(LuaType::Unknown)
+            );
             let (_, enumerated) = members.iter().next().unwrap();
             assert_eq!(enumerated.typ(db), &LuaType::Unknown);
             assert!(is_assignable(db, &empty, typ, Some(&mut cache)));
@@ -1006,7 +1025,9 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(types, vec![LuaType::String]);
         assert_eq!(
-            entry.member_type(db, &typ, &LuaMemberKey::Name("value".into())),
+            entry
+                .member_type(db, &typ, &LuaMemberKey::Name("value".into()))
+                .cloned(),
             Some(LuaType::String)
         );
         assert!(is_assignable(db, &source, &typ, None));
@@ -1051,7 +1072,9 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let entry = TypeCacheEntry::default();
         assert_eq!(
-            entry.member_type(db, &typ, &LuaMemberKey::Name("missing".into())),
+            entry
+                .member_type(db, &typ, &LuaMemberKey::Name("missing".into()))
+                .cloned(),
             None
         );
         let members = entry.members.get().unwrap();
@@ -1063,7 +1086,10 @@ mod test {
             panic!("expected an uninstantiated alias field");
         };
         assert!(matches!(raw.get_base(), LuaType::TplRef(_)));
-        assert_eq!(entry.member_type(db, &typ, &used_key), Some(expected));
+        assert_eq!(
+            entry.member_type(db, &typ, &used_key).cloned(),
+            Some(expected)
+        );
         assert!(members[&used_key].typ.get().is_some());
         for (key, member) in members {
             if *key != used_key {
@@ -1083,7 +1109,10 @@ mod test {
         assert_eq!(members.len(), 3);
         assert!(members.values().all(|member| member.typ.get().is_none()));
         let key = LuaMemberKey::Name("value".into());
-        assert_eq!(entry.member_type(db, &typ, &key), Some(LuaType::Number));
+        assert_eq!(
+            entry.member_type(db, &typ, &key).cloned(),
+            Some(LuaType::Number)
+        );
         let MemberOrigin::Intersection(branches) = &members[&key].origin else {
             panic!("expected an intersection member");
         };
@@ -1117,13 +1146,15 @@ mod test {
         assert_eq!(members.len(), 2);
         assert!(members.values().all(|member| member.typ.get().is_none()));
         assert_eq!(
-            entry.member_type(db, &typ, &LuaMemberKey::TypeKey(LuaType::String)),
+            entry
+                .member_type(db, &typ, &LuaMemberKey::TypeKey(LuaType::String))
+                .cloned(),
             Some(LuaType::Boolean)
         );
         let integer_key = LuaMemberKey::TypeKey(LuaType::Integer);
         assert!(members[&integer_key].typ.get().is_none());
         assert_eq!(
-            entry.member_type(db, &typ, &integer_key),
+            entry.member_type(db, &typ, &integer_key).cloned(),
             Some(LuaType::Number)
         );
     }
@@ -1141,12 +1172,15 @@ mod test {
         assert!(members.values().all(|member| member.typ.get().is_none()));
         let value_key = LuaMemberKey::Name("value".into());
         assert_eq!(
-            entry.member_type(db, &typ, &value_key),
+            entry.member_type(db, &typ, &value_key).cloned(),
             Some(LuaType::String)
         );
         let next_key = LuaMemberKey::Name("next".into());
         assert!(members[&next_key].typ.get().is_none());
-        assert_eq!(entry.member_type(db, &typ, &next_key), Some(expected));
+        assert_eq!(
+            entry.member_type(db, &typ, &next_key).cloned(),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -1163,7 +1197,7 @@ mod test {
             .unwrap()
             .remove(0)
             .typ;
-        assert_eq!(entry.member_type(db, &typ, &used), Some(expected));
+        assert_eq!(entry.member_type(db, &typ, &used).cloned(), Some(expected));
         let unused = &members[&LuaMemberKey::Name("cache_global_unused".into())];
         assert!(matches!(unused.origin, MemberOrigin::Decl(_)));
         assert!(unused.typ.get().is_none());
@@ -1186,7 +1220,9 @@ mod test {
         for typ in types {
             let entry = TypeCacheEntry::default();
             assert_eq!(
-                entry.member_type(db, &typ, &LuaMemberKey::Name("value".into())),
+                entry
+                    .member_type(db, &typ, &LuaMemberKey::Name("value".into()))
+                    .cloned(),
                 Some(LuaType::String)
             );
         }
@@ -1209,7 +1245,9 @@ mod test {
         for typ in types {
             let entry = TypeCacheEntry::default();
             assert_eq!(
-                entry.member_type(db, &typ, &LuaMemberKey::Name("value".into())),
+                entry
+                    .member_type(db, &typ, &LuaMemberKey::Name("value".into()))
+                    .cloned(),
                 Some(LuaType::String)
             );
         }
@@ -1223,7 +1261,9 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let entry = TypeCacheEntry::default();
         assert_eq!(
-            entry.member_type(db, &typ, &LuaMemberKey::Integer(2)),
+            entry
+                .member_type(db, &typ, &LuaMemberKey::Integer(2))
+                .cloned(),
             Some(LuaType::String)
         );
         let unused = &entry.members(db, &typ)[&LuaMemberKey::Integer(1)];
@@ -1242,6 +1282,11 @@ mod test {
         let db = ws.analysis.compilation.get_db();
         let entry = TypeCacheEntry::default();
         assert!(entry.members(db, &typ).is_empty());
-        assert_eq!(entry.member_type(db, &typ, &LuaMemberKey::Integer(1)), None);
+        assert_eq!(
+            entry
+                .member_type(db, &typ, &LuaMemberKey::Integer(1))
+                .cloned(),
+            None
+        );
     }
 }

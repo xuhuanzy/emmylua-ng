@@ -183,6 +183,7 @@ impl<'a> SemanticModel<'a> {
         get_member_map_in_scope(self.db, self.file_id, prefix_type)
     }
 
+    #[inline]
     pub fn is_assignable(&self, source: &LuaType, target: &LuaType) -> bool {
         !matches!(
             self.probe_assignable(source, target),
@@ -190,6 +191,7 @@ impl<'a> SemanticModel<'a> {
         )
     }
 
+    #[inline]
     pub(crate) fn probe_assignable(&self, source: &LuaType, target: &LuaType) -> RelationResult {
         if fast_eq_check(source, target) {
             return Ok(());

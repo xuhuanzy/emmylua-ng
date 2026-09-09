@@ -6,7 +6,7 @@ use crate::{
 };
 
 use super::super::relation::{IntersectionState, Relater, RelationFailure, RelationResult};
-use super::{member::visit_members, tuple::visit_tuple_index_entries};
+use super::{member::MemberView, tuple::visit_tuple_index_entries};
 
 #[derive(Clone, Copy)]
 enum EntryOrigin<'a> {
@@ -46,7 +46,7 @@ fn visit_index_entries(
             }
             Ok(())
         }
-        _ => visit_members(relater, source, |relater, key, value| {
+        _ => MemberView::new(relater, source).visit_types(relater, |relater, key, value| {
             if let Some(key_type) = key.to_index_type() {
                 visitor(relater, &key_type, value, EntryOrigin::Field(key))?;
             }

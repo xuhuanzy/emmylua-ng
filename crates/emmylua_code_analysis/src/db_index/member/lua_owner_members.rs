@@ -1,11 +1,12 @@
 use indexmap::IndexMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::{LuaMemberIndexItem, LuaMemberKey};
 
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct LuaOwnerMembers {
-    members: IndexMap<LuaMemberKey, LuaMemberIndexItem>,
+    members: IndexMap<LuaMemberKey, LuaMemberIndexItem, FxBuildHasher>,
     resolve_state: OwnerMemberStatus,
 }
 
@@ -13,7 +14,7 @@ pub struct LuaOwnerMembers {
 impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
-            members: IndexMap::new(),
+            members: IndexMap::default(),
             resolve_state: OwnerMemberStatus::UnResolved,
         }
     }

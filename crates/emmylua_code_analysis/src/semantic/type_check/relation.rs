@@ -1,3 +1,4 @@
+use hashbrown::Equivalent;
 use std::{rc::Rc, sync::Arc};
 
 use crate::{
@@ -17,6 +18,21 @@ use super::{
 
 pub(crate) type RelationResult = Result<(), RelationFailure>;
 type RelationKey = (LuaType, LuaType, IntersectionState);
+
+#[derive(Hash)]
+struct BorrowedRelationKey<'a>(&'a LuaType, &'a LuaType, IntersectionState);
+
+impl Equivalent<RelationKey> for BorrowedRelationKey<'_> {
+    fn equivalent(&self, key: &RelationKey) -> bool {
+        self.0 == &key.0 && self.1 == &key.1 && self.2 == key.2
+    }
+}
+
+impl BorrowedRelationKey<'_> {
+    fn into_owned(self) -> RelationKey {
+        (self.0.clone(), self.1.clone(), self.2)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelationFailure {
@@ -101,10 +117,6 @@ impl<'db> Relater<'db> {
         matches!(self.evidence, EvidenceMode::Explain)
     }
 
-    pub(super) fn remaining_relation_budget(&self) -> usize {
-        self.relation_budget as usize
-    }
-
     pub(super) fn consume_relation_budget(&mut self) -> RelationResult {
         if self.relation_budget == 0 {
             return Err(RelationFailure::Indeterminate(OverflowKind::Budget));
@@ -138,13 +150,16 @@ impl<'db> Relater<'db> {
     ) -> RelationResult {
         if matches!(
             source,
-            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)
+            LuaType::IntegerConst(_)
+                | LuaType::DocIntegerConst(_)
+                | LuaType::StringConst(_)
+                | LuaType::DocStringConst(_)
         ) && accept_const_enum_member(self.db, source, target)
         {
             return Ok(());
         }
 
-        let key = (source.clone(), target.clone(), intersection_state);
+        let key = BorrowedRelationKey(source, target, intersection_state);
         if let Some(&related) = self.cache.relations.get(&key) {
             if related {
                 return Ok(());
@@ -160,10 +175,10 @@ impl<'db> Relater<'db> {
         let result = self.relate_uncached(source, target, intersection_state);
         match result {
             Ok(()) if is_root || assumption_count == self.assumption_count => {
-                self.cache.relations.insert(key, true);
+                self.cache.relations.insert(key.into_owned(), true);
             }
             Err(RelationFailure::Unrelated) => {
-                self.cache.relations.insert(key, false);
+                self.cache.relations.insert(key.into_owned(), false);
             }
             _ => {}
         }
@@ -339,17 +354,18 @@ impl<'db> Relater<'db> {
     }
 }
 
-/// 常量对巨型枚举集合的快速命中.
+/// 常量对枚举/联合体集合的快速早退命中.
+#[inline(always)]
 fn accept_const_enum_member(db: &DbIndex, source: &LuaType, target: &LuaType) -> bool {
-    let target_origin = match target {
-        LuaType::Union(_) => Some(target),
-        LuaType::Ref(target_id) => db
+    let target = match target {
+        LuaType::Union(_) | LuaType::MultiLineUnion(_) => Some(target),
+        LuaType::Ref(id) => db
             .get_type_index()
-            .get_type_decl(target_id)
-            .and_then(|target_decl| target_decl.get_alias_ref()),
+            .get_type_decl(id)
+            .and_then(|decl| decl.get_alias_ref()),
         _ => None,
     };
-    match target_origin {
+    match target {
         Some(LuaType::MultiLineUnion(union)) => union
             .get_unions()
             .iter()

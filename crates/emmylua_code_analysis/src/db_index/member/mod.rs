@@ -7,11 +7,12 @@ mod lua_owner_members;
 use hashbrown::{HashMap, HashSet};
 
 use super::traits::LuaIndex;
-use crate::{FileId, db_index::member::lua_owner_members::LuaOwnerMembers};
+use crate::FileId;
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
 pub use lua_member_item::LuaMemberIndexItem;
 pub use lua_member_owner::LuaMemberOwner;
+pub(crate) use lua_owner_members::LuaOwnerMembers;
 
 #[derive(Debug)]
 pub struct LuaMemberIndex {
@@ -196,6 +197,10 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
     ) -> Option<impl Iterator<Item = (&LuaMemberKey, &LuaMemberIndexItem)>> {
         Some(self.owner_members.get(owner)?.iter())
+    }
+
+    pub(crate) fn get_owner_members(&self, owner: &LuaMemberOwner) -> Option<&LuaOwnerMembers> {
+        self.owner_members.get(owner)
     }
 
     pub fn get_member_item_by_member_id(

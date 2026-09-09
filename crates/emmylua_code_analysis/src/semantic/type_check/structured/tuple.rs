@@ -12,9 +12,7 @@ use super::super::{
 use super::{
     array::effective_array_base,
     index::relate_index_member,
-    member::{
-        find_source_member_type, probe_missing_member, unrelated_missing_members, visit_members,
-    },
+    member::{MemberView, unrelated_missing_members},
 };
 
 pub(super) fn relate_tuple_to_tuple(
@@ -161,10 +159,11 @@ pub(super) fn relate_keyed_source_to_tuple(
     target_tuple: &LuaTupleType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
+    let source_members = MemberView::new(relater, source);
     for (index, target_type) in target_tuple.get_types().iter().enumerate() {
         relater.consume_relation_budget()?;
         let key = LuaMemberKey::Integer(index as i64 + 1);
-        let source_type = find_source_member_type(relater, source, &key, intersection_state)?;
+        let source_type = source_members.member_type(relater, &key, intersection_state)?;
         let Some(source_type) = source_type else {
             if is_optional(relater.db(), target_type) {
                 continue;
@@ -235,13 +234,15 @@ pub(super) fn relate_tuple_to_declared_target(
     source_tuple: &LuaTupleType,
     intersection_state: IntersectionState,
 ) -> RelationResult {
+    let target_members = MemberView::new(relater, target);
     if relater.is_explain() {
+        let db = relater.db();
         let mut missing_keys = Vec::new();
-        visit_members(relater, target, |relater, key, target_member_type| {
+        target_members.visit(db, |key, member| {
             if !matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::None) {
                 return Ok(());
             }
-            if probe_missing_member(relater, source, key, target_member_type, intersection_state)? {
+            if !is_optional(db, &member.typ(db)) {
                 missing_keys.push(key.clone());
             }
             Ok(())
@@ -253,10 +254,8 @@ pub(super) fn relate_tuple_to_declared_target(
 
     // 检查是否含有必需的命名字段
     let mut has_integer_or_index = false;
-    let result = visit_members(
-        relater,
-        target,
-        |relater, key, target_member_type| match key {
+    let result =
+        target_members.visit_types(relater, |relater, key, target_member_type| match key {
             LuaMemberKey::Integer(idx) if *idx > 0 => {
                 has_integer_or_index = true;
                 let index = (*idx - 1) as usize;
@@ -293,8 +292,7 @@ pub(super) fn relate_tuple_to_declared_target(
                 }
                 Ok(())
             }
-        },
-    );
+        });
 
     if result.is_ok() && !has_integer_or_index {
         return relater.fail(|db| not_assignable_message(db, source, target));

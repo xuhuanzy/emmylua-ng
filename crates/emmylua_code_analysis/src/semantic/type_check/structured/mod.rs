@@ -158,11 +158,10 @@ pub(in crate::semantic::type_check) fn dispatch_structured(
                 LuaType::Tuple(source_tuple) => {
                     relate_tuple_to_array(relater, source_tuple, target_array, intersection_state)
                 }
-                LuaType::TableConst(source_range) => relate_table_const_to_array(
+                LuaType::TableConst(_) => relate_table_const_to_array(
                     relater,
                     source,
                     target,
-                    source_range,
                     target_array,
                     intersection_state,
                 ),

@@ -4,8 +4,9 @@ mod type_cache;
 pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use emmylua_parser::{LuaExpr, LuaSyntaxId, LuaVarExpr};
 use hashbrown::{HashMap, HashSet};
+use rustc_hash::FxBuildHasher;
 use std::{mem, rc::Rc, sync::Arc};
-pub(in crate::semantic) use type_cache::TypeCacheEntry;
+pub(in crate::semantic) use type_cache::{MemberSymbol, TypeCacheEntry};
 
 use crate::{
     FileId, FlowId, LuaFunctionType,
@@ -216,12 +217,13 @@ impl LuaInferCache {
 
 #[derive(Debug, Default)]
 pub(crate) struct SemanticLocalCache {
-    type_entries: HashMap<LuaType, Rc<TypeCacheEntry>>,
-    pub(in crate::semantic) relations: HashMap<(LuaType, LuaType, IntersectionState), bool>,
+    type_entries: HashMap<LuaType, Rc<TypeCacheEntry>, FxBuildHasher>,
+    pub(in crate::semantic) relations:
+        HashMap<(LuaType, LuaType, IntersectionState), bool, FxBuildHasher>,
 }
 
 impl SemanticLocalCache {
     pub(in crate::semantic) fn type_entry(&mut self, typ: &LuaType) -> Rc<TypeCacheEntry> {
-        self.type_entries.entry(typ.clone()).or_default().clone()
+        self.type_entries.entry_ref(typ).or_default().clone()
     }
 }
